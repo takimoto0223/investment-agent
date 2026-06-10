@@ -18,6 +18,7 @@ class RiskLimits:
     max_us_position_usd: int = int(os.getenv("MAX_US_POSITION_USD", 3_000))
     max_concentration_pct: float = 0.20   # 1銘柄がポートフォリオの20%を超えない
     daytrade_stop_loss_pct: float = 0.02  # 建玉に対し2%逆行したら強制決済
+    usd_jpy_rate: float = float(os.getenv("USD_JPY_RATE", 155.0))  # 大口判定の円換算レート
 
 
 @dataclass

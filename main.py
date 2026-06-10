@@ -215,13 +215,16 @@ def run_us_paper_session():
     """
     from brokers.alpaca import AlpacaBroker
     from data import us_market as us_mkt
+    from agents.critic_us import CriticUSAgent
+    from agents.fx_strategy import FXStrategyAgent
 
     logger.info("=== 米国株ペーパートレードセッション開始 ===")
 
-    cio           = CIOAgent()
+    cio            = CIOAgent()
     daytrade_agent = DaytradeAgent()
-    critic        = CriticDayAgent()
-    broker        = AlpacaBroker()
+    critic         = CriticUSAgent()
+    fx_agent       = FXStrategyAgent()
+    broker         = AlpacaBroker()
 
     # 1. 口座確認
     acct = broker.get_account()
@@ -233,9 +236,10 @@ def run_us_paper_session():
 
     # 2. MarketContext 生成
     logger.info("CIO: マーケットコンテキスト生成中...")
+    macro_data = "USD/JPY=155.2, VIX=18.5, 米10Y=4.35%, S&P500先物=+0.3%"
     ctx = cio.generate_market_context(
         news_summary="（米国株市場オープン時のコンテキスト生成）",
-        macro_data="USD/JPY=155.2, VIX=18.5, 米10Y=4.35%, S&P500先物=+0.3%",
+        macro_data=macro_data,
     )
     logger.info(f"コンテキスト: risk={ctx.risk_level}, rotation={ctx.rotation_signal}")
 
@@ -243,18 +247,27 @@ def run_us_paper_session():
         logger.warning("リスク水準 HIGH のためセッションを中止します")
         return
 
-    # 3. 米国株ユニバース構築
+    # 3. FX シグナル取得（クリティークに渡す）
+    logger.info("FX戦略シグナル取得中...")
+    current_usd_ratio = acct["equity"] / (acct["equity"] * 155.0 + 1) * 100  # 概算
+    fx_signal = fx_agent.generate_signal(macro_data, current_usd_ratio / 100, ctx)
+    logger.info(
+        f"FXシグナル: {fx_signal.get('fx_signal')} "
+        f"us_weight_bias={fx_signal.get('us_weight_bias')}"
+    )
+
+    # 4. 米国株ユニバース構築
     logger.info("米国株ユニバース構築中（Alpaca データ取得）...")
     universe = us_mkt.build_us_universe(_US_BASE_SYMBOLS)
 
-    # 4. 候補銘柄スクリーニング
+    # 5. 候補銘柄スクリーニング
     candidates = daytrade_agent.screen_candidates(universe, ctx)
     logger.info(f"候補銘柄: {candidates}")
     if not candidates:
         logger.info("本日の米国株デイトレ対象なし。終了します")
         return
 
-    # 5. 各候補の取引提案 → クリティーク → ペーパー発注
+    # 6. 各候補の取引提案 → CriticUSAgent → ペーパー発注
     for symbol in candidates:
         try:
             quote     = us_mkt.get_quote_us(symbol)
@@ -271,9 +284,8 @@ def run_us_paper_session():
             if not proposal:
                 continue
 
-            # クリティーク審査（ペーパーなので余力は buying_power で代替）
-            wallet = {"MarginAccountWallet": acct["buying_power"]}
-            verdict = critic.review(proposal, ctx, wallet)
+            # CriticUSAgent で審査（FXシグナル・ドル建て大口判定・市場時間チェック含む）
+            verdict = critic.review(proposal, ctx, acct, fx_signal)
             if not verdict.approved:
                 logger.info(f"{symbol}: クリティーク否決 - {verdict.suggestion}")
                 continue

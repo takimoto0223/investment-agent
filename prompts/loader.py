@@ -26,6 +26,8 @@ def get_prompt(agent_name: str) -> str:
         "{MAX_DAYTRADE_MARGIN_JPY}":  f"{RISK.max_daytrade_margin_jpy:,}",
         "{MAX_LOSS_PER_DAY_JPY}":     f"{RISK.max_loss_per_day_jpy:,}",
         "{DAYTRADE_STOP_LOSS_PCT}":   str(int(RISK.daytrade_stop_loss_pct * 100)),
+        "{USD_JPY_RATE}":             f"{RISK.usd_jpy_rate:.1f}",
+        "{MAX_US_POSITION_USD}":      f"{RISK.max_us_position_usd:,}",
     }
 
     result = template
