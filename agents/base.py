@@ -95,17 +95,37 @@ class BaseAgent:
     def _ask_llm_json(self, user_message: str, extra_system: str = "") -> dict | list:
         """
         JSONのみを返すよう指示してLLMに問い合わせ、パースして返す。
-        ハルシネーション対策：JSON以外が返った場合はエラーをログし空dictを返す。
+        LLMが reasoning など前置きJSONを出力した場合もリカバリーする。
         """
         json_instruction = "\n\n必ずJSON形式のみで回答してください。前置き・説明文・マークダウンのコードブロックは不要です。"
         raw = self._ask_llm(user_message, extra_system + json_instruction)
         # ```json ... ``` ブロックが混入した場合の除去
         raw = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+        # まず完全文字列をパース
         try:
             return json.loads(raw)
-        except json.JSONDecodeError as e:
-            self.logger.error(f"JSON解析失敗: {e}\n原文: {raw[:200]}")
-            return {}
+        except json.JSONDecodeError:
+            pass
+
+        # LLMが複数のJSON値を返した場合（例: reasoning dict + 結果 list）のリカバリー
+        # 最初の完全なJSON値を取り出し、その後に続くJSON値も試みる
+        decoder = json.JSONDecoder()
+        try:
+            first, end_pos = decoder.raw_decode(raw)
+            remainder = raw[end_pos:].strip()
+            # 最初がdictで残りに別のJSON値がある場合は残りを優先（期待値が後にある場合）
+            if remainder and isinstance(first, dict):
+                try:
+                    return json.loads(remainder)
+                except json.JSONDecodeError:
+                    pass
+            return first
+        except json.JSONDecodeError:
+            pass
+
+        self.logger.error(f"JSON解析失敗（リカバリー不能）\n原文: {raw[:200]}")
+        return {}
 
     def _log_proposal(self, proposal: TradeProposal):
         self.logger.info(

@@ -25,6 +25,7 @@ from agents.daytrade import DaytradeAgent
 from agents.critic_day import CriticDayAgent
 from brokers.kabu import KabuBroker
 from config.settings import RISK
+from data import market as mkt
 
 # ── ログ設定 ──────────────────────────────────────
 # Windowsコンソールの文字化け対策
@@ -66,12 +67,12 @@ def is_near_close() -> bool:
 # デイトレセッション
 # ──────────────────────────────────────────────────
 
-# サンプルユニバース（本番では data/screener.py が動的に生成する）
-SAMPLE_UNIVERSE = [
-    {"symbol": "9984", "name": "ソフトバンクG",  "volume_ratio": 2.3, "atr_pct": 2.8},
-    {"symbol": "6857", "name": "アドバンテスト",  "volume_ratio": 1.8, "atr_pct": 2.1},
-    {"symbol": "4063", "name": "信越化学",         "volume_ratio": 1.1, "atr_pct": 1.2},
-    {"symbol": "2330", "name": "フィックスターズ", "volume_ratio": 3.1, "atr_pct": 3.5},
+# ベース銘柄リスト（volume_ratio・atr_pct は data/market.py が動的に計算して付加する）
+_BASE_SYMBOLS = [
+    {"symbol": "9984", "name": "ソフトバンクG"},
+    {"symbol": "6857", "name": "アドバンテスト"},
+    {"symbol": "4063", "name": "信越化学"},
+    {"symbol": "2330", "name": "フィックスターズ"},
 ]
 
 
@@ -87,7 +88,7 @@ def run_daytrade_session(paper: bool = True):
     # 1. MarketContext 生成
     logger.info("CIO: マーケットコンテキスト生成中...")
     ctx = cio.generate_market_context(
-        news_summary="（本番では data/market.py からニュース取得）",
+        news_summary="（本番では外部ニュースAPIから取得）",
         macro_data="USD/JPY=155.2, VIX=18.5, 米10Y=4.35%",
     )
     logger.info(f"コンテキスト: risk={ctx.risk_level}, rotation={ctx.rotation_signal}")
@@ -97,31 +98,35 @@ def run_daytrade_session(paper: bool = True):
         logger.warning("リスク水準 HIGH のためデイトレセッションを中止します")
         return
 
-    # 2. 候補銘柄スクリーニング
-    candidates = daytrade_agent.screen_candidates(SAMPLE_UNIVERSE, ctx)
+    # 2. ユニバース構築（volume_ratio・atr_pct を動的に計算）
+    logger.info("ユニバース構築中（板情報・日足データ取得）...")
+    universe = mkt.build_universe(_BASE_SYMBOLS)
+    mock_flag = any(mkt.check_kabu_connection() is False for _ in [None])
+    if not mkt.check_kabu_connection():
+        logger.info("モードモック: kabuステーション未接続のためモックデータを使用")
+
+    # 3. 候補銘柄スクリーニング
+    candidates = daytrade_agent.screen_candidates(universe, ctx)
     logger.info(f"候補銘柄: {candidates}")
     if not candidates:
         logger.info("本日のデイトレ対象なし。終了します")
         return
 
-    # 3. 各候補の取引提案 → クリティーク → 発注
+    # 4. 各候補の取引提案 → クリティーク → 発注
     open_positions: dict[str, dict] = {}  # symbol -> {entry_price, side, qty, order_id}
 
     for symbol in candidates:
         try:
-            # 板データ取得（本番）
-            if not paper:
-                board_data = broker.get_board(symbol)
-            else:
-                # ペーパー用のモックデータ
-                board_data = {"CurrentPrice": 2000, "CalcPrice": 2000}
+            # 板データ・5分足データを取得（モック自動切替あり）
+            board_data = mkt.get_board(symbol) if paper else broker.get_board(symbol)
+            bars_5min  = mkt.get_bars_5min(symbol)
 
             # 提案生成
             proposal = daytrade_agent.generate_trade_proposal(
                 symbol=symbol,
-                symbol_name=next((u["name"] for u in SAMPLE_UNIVERSE if u["symbol"] == symbol), symbol),
+                symbol_name=next((u["name"] for u in universe if u["symbol"] == symbol), symbol),
                 board_data=board_data,
-                bars_5min=[],  # 本番では data/market.py が取得
+                bars_5min=bars_5min,
                 ctx=ctx,
             )
             if not proposal:
