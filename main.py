@@ -11,8 +11,10 @@ main.py
   6. 引け前に全ポジション強制決済
 
 実行コマンド:
-  python main.py --mode daytrade   # 日本株デイトレセッション
-  python main.py --mode paper      # ペーパートレード（発注しない）
+  python main.py --mode daytrade       # 日本株デイトレセッション
+  python main.py --mode paper          # ペーパートレード（発注しない）
+  python main.py --mode us_paper       # 米国株ペーパートレード（Alpaca）
+  python main.py --mode intelligence   # 情報収集・議論セッション（毎日 23:00 想定）
 """
 import argparse
 import logging
@@ -311,6 +313,157 @@ def run_us_paper_session():
     logger.info("=== 米国株ペーパートレードセッション終了 ===")
 
 
+# ──────────────────────────────────────────────────────────────────
+# 情報収集・議論セッション（毎日 23:00）
+# ──────────────────────────────────────────────────────────────────
+
+def run_intelligence_session():
+    """
+    毎日 23:00 に実行するインテリジェンス収集・議論セッション。
+    1. IntelligenceAgent でシグナル収集（arxiv / GitHub / HackerNews）
+    2. CriticIntelligenceAgent で審査
+    3. relevance_score >= 0.75 のシグナルについてエージェント議論
+    4. 結果を logs/discussion_log.json に追記保存
+    """
+    import json as _json
+    from pathlib import Path
+    from datetime import datetime as _dt
+    from agents.intelligence import IntelligenceAgent
+    from agents.critic_intelligence import CriticIntelligenceAgent
+    from agents.discussion import DiscussionOrchestratorAgent
+    from agents.equity import EquityAgent
+    from agents.fx_strategy import FXStrategyAgent
+    from agents.risk_manager import RiskManagerAgent
+
+    logger.info("=== インテリジェンスセッション開始 ===")
+
+    intel_agent  = IntelligenceAgent()
+    critic_intel = CriticIntelligenceAgent()
+    discussion   = DiscussionOrchestratorAgent()
+    cio          = CIOAgent()
+    equity       = EquityAgent()
+    fx           = FXStrategyAgent()
+    risk         = RiskManagerAgent()
+
+    # 1. MarketContext 生成
+    logger.info("CIO: マーケットコンテキスト生成中...")
+    macro_data = "USD/JPY=155.2, VIX=18.5, 米10Y=4.35%, S&P500先物=フラット"
+    ctx = cio.generate_market_context(
+        news_summary="（インテリジェンスセッション用コンテキスト）",
+        macro_data=macro_data,
+    )
+    logger.info(f"コンテキスト: risk={ctx.risk_level}, rotation={ctx.rotation_signal}")
+
+    # 2. シグナル収集
+    logger.info("情報収集中（arxiv / GitHub / HackerNews）...")
+    raw_result   = intel_agent.collect(ctx)
+    raw_signals  = raw_result.get("signals", [])
+    logger.info(f"収集シグナル数: {len(raw_signals)} 件")
+
+    if not raw_signals:
+        logger.info("シグナルなし。セッション終了")
+        return
+
+    # 3. クリティーク審査
+    logger.info("CriticIntelligence: シグナル審査中...")
+    approved_signals = critic_intel.review(raw_signals, ctx)
+    logger.info(f"承認シグナル数: {len(approved_signals)} 件")
+
+    # 4. 高スコアシグナルの議論
+    high_score = [s for s in approved_signals if s.get("relevance_score", 0) >= 0.75]
+    logger.info(f"議論対象シグナル数: {len(high_score)} 件（score >= 0.75）")
+
+    discussion_results: list[dict] = []
+    for signal in high_score:
+        logger.info(
+            f"議論開始: [{signal.get('relevance_score', 0):.2f}] "
+            f"{signal.get('title', '')[:60]}"
+        )
+        result = discussion.run(
+            signal, ctx,
+            cio_agent=cio,
+            equity_agent=equity,
+            fx_agent=fx,
+            risk_agent=risk,
+        )
+        discussion_results.append(result)
+
+    # 5. logs/discussion_log.json に追記保存
+    log_path = Path("logs/discussion_log.json")
+    log_path.parent.mkdir(exist_ok=True)
+
+    session_record = {
+        "session_date":      _dt.now().isoformat(),
+        "signals_found":     len(raw_signals),
+        "signals_approved":  len(approved_signals),
+        "signals_discussed": len(high_score),
+        "approved_signals":  approved_signals,
+        "discussions":       discussion_results,
+    }
+
+    existing: list[dict] = []
+    if log_path.exists():
+        try:
+            existing = _json.loads(log_path.read_text(encoding="utf-8"))
+        except (_json.JSONDecodeError, OSError):
+            existing = []
+
+    existing.append(session_record)
+    existing = existing[-30:]  # 最新 30 セッションのみ保持
+    log_path.write_text(
+        _json.dumps(existing, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logger.info(f"議論ログ保存: {log_path}")
+
+    # 6. セッションサマリー出力
+    execute_count = sum(1 for r in discussion_results if r.get("verdict") == "execute")
+    defer_count   = sum(1 for r in discussion_results if r.get("verdict") == "defer")
+    reject_count  = sum(1 for r in discussion_results if r.get("verdict") == "reject")
+    logger.info(
+        f"議論サマリー: execute={execute_count} / defer={defer_count} / reject={reject_count}"
+    )
+    for result in discussion_results:
+        logger.info(
+            f"  [{result.get('verdict', '?')}] {result.get('signal_title', '')[:60]}"
+        )
+
+    logger.info("=== インテリジェンスセッション終了 ===")
+
+
+def run_morning_report() -> str:
+    """
+    朝 6 時レポート：直近のインテリジェンス議論サマリーを含む日次レポートを生成する。
+    """
+    import json as _json
+    from pathlib import Path
+
+    lines = [f"=== 朝次レポート {datetime.now().strftime('%Y-%m-%d %H:%M')} ==="]
+
+    log_path = Path("logs/discussion_log.json")
+    if log_path.exists():
+        try:
+            sessions = _json.loads(log_path.read_text(encoding="utf-8"))
+            if sessions:
+                latest = sessions[-1]
+                lines.append(f"\n【インテリジェンス議論サマリー（{latest['session_date'][:10]}）】")
+                lines.append(f"  収集シグナル: {latest.get('signals_found', 0)} 件")
+                lines.append(f"  承認シグナル: {latest.get('signals_approved', 0)} 件")
+                for disc in latest.get("discussions", []):
+                    verdict = disc.get("verdict", "?")
+                    title   = disc.get("signal_title", "")[:50]
+                    score   = disc.get("signal_score", 0)
+                    lines.append(f"  [{verdict}] ({score:.2f}) {title}")
+        except (_json.JSONDecodeError, OSError, KeyError):
+            lines.append("  議論ログ読み込み失敗")
+    else:
+        lines.append("  議論ログなし（インテリジェンスセッション未実行）")
+
+    report = "\n".join(lines)
+    logger.info(report)
+    return report
+
+
 # ──────────────────────────────────────────────────
 # スケジューラー（指定時刻まで待機して実行）
 # ──────────────────────────────────────────────────
@@ -340,9 +493,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="マルチエージェント投資システム")
     parser.add_argument(
         "--mode",
-        choices=["daytrade", "paper", "us_paper"],
+        choices=["daytrade", "paper", "us_paper", "intelligence", "morning_report"],
         default="paper",
-        help="実行モード: daytrade=日本株本番, paper=日本株ペーパー, us_paper=米国株ペーパー",
+        help=(
+            "実行モード: daytrade=日本株本番, paper=日本株ペーパー, "
+            "us_paper=米国株ペーパー, intelligence=情報収集・議論, "
+            "morning_report=朝次レポート"
+        ),
     )
     parser.add_argument(
         "--schedule",
@@ -356,5 +513,9 @@ if __name__ == "__main__":
 
     if args.mode == "us_paper":
         run_us_paper_session()
+    elif args.mode == "intelligence":
+        run_intelligence_session()
+    elif args.mode == "morning_report":
+        run_morning_report()
     else:
         run_daytrade_session(paper=(args.mode == "paper"))

@@ -89,6 +89,38 @@ class CIOAgent(BaseAgent):
         self.logger.info(f"MarketContext生成完了: risk={ctx.risk_level}, rotation={ctx.rotation_signal}")
         return ctx
 
+    def evaluate(self, signal: dict, ctx: MarketContext) -> dict:
+        """
+        議論オーケストレーター用：シグナルがセクタースコアに与える影響を評価する。
+        """
+        prompt = f"""
+## 評価対象シグナル
+{json.dumps(signal, ensure_ascii=False, indent=2)}
+
+## 現在のセクタースコア
+{json.dumps(ctx.sector_scores, ensure_ascii=False)}
+
+## 市場コンテキスト
+- ローテーション: {ctx.rotation_signal}
+- リスク水準: {ctx.risk_level}
+
+CIO の視点からこのシグナルを評価してください。
+セクタースコアへの影響・サプライチェーン連動・ローテーション方向性を考慮し JSON で返してください。
+
+{{
+  "opinion": "賛成 | 反対 | 保留",
+  "rationale": "根拠 100 文字以内（セクタースコア・サプライチェーン波及を含める）",
+  "suggested_action": "具体的な提案（スコア調整・セクター優先度変更等）"
+}}
+"""
+        data = self._ask_llm_json(prompt)
+        return {
+            "agent":            self.name,
+            "opinion":          data.get("opinion", "保留"),
+            "rationale":        data.get("rationale", ""),
+            "suggested_action": data.get("suggested_action", ""),
+        }
+
     def evaluate_portfolio_rotation(self, current_holdings: list[dict], ctx: MarketContext) -> str:
         """
         現在の保有銘柄とコンテキストを照らし合わせ、リバランス提案を自然言語で返す。

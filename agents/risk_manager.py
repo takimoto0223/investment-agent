@@ -82,3 +82,32 @@ class RiskManagerAgent(BaseAgent):
             f"取引停止={data.get('trading_suspended')}"
         )
         return data
+
+    def evaluate(self, signal: dict, ctx: MarketContext) -> dict:
+        """
+        議論オーケストレーター用：シグナルに基づく投資がポートフォリオリスクに与える影響を評価する。
+        """
+        prompt = f"""
+## 評価対象シグナル
+{json.dumps(signal, ensure_ascii=False, indent=2)}
+
+## 市場コンテキスト
+- リスク水準: {ctx.risk_level}
+- セクタースコア: {json.dumps(ctx.sector_scores, ensure_ascii=False)}
+
+リスクマネージャーの視点からこのシグナルを評価してください。
+セクター集中リスク・下流波及による VaR 増加・資金配分リスクを考慮し JSON で返してください。
+
+{{
+  "opinion": "賛成 | 反対 | 保留",
+  "rationale": "根拠 100 文字以内（セクター集中・VaR・リスク総量を含める）",
+  "suggested_action": "具体的な提案（ポジションサイズ上限・ヘッジ等）"
+}}
+"""
+        data = self._ask_llm_json(prompt)
+        return {
+            "agent":            self.name,
+            "opinion":          data.get("opinion", "保留"),
+            "rationale":        data.get("rationale", ""),
+            "suggested_action": data.get("suggested_action", ""),
+        }
