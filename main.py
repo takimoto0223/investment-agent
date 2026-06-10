@@ -193,12 +193,156 @@ def run_daytrade_session(paper: bool = True):
 
 
 # ──────────────────────────────────────────────────
+# 米国株ペーパートレードセッション
+# ──────────────────────────────────────────────────
+
+# テスト対象の米国株ユニバース（AI・半導体・テック中心）
+_US_BASE_SYMBOLS = [
+    {"symbol": "NVDA",  "name": "エヌビディア"},
+    {"symbol": "AAPL",  "name": "アップル"},
+    {"symbol": "MSFT",  "name": "マイクロソフト"},
+    {"symbol": "TSLA",  "name": "テスラ"},
+    {"symbol": "META",  "name": "メタ"},
+    {"symbol": "AMZN",  "name": "アマゾン"},
+    {"symbol": "GOOGL", "name": "アルファベット"},
+]
+
+
+def run_us_paper_session():
+    """
+    米国株ペーパートレードセッション。
+    Alpaca paper-API に接続し、エージェントの提案を実際にペーパー発注する。
+    """
+    from brokers.alpaca import AlpacaBroker
+    from data import us_market as us_mkt
+
+    logger.info("=== 米国株ペーパートレードセッション開始 ===")
+
+    cio           = CIOAgent()
+    daytrade_agent = DaytradeAgent()
+    critic        = CriticDayAgent()
+    broker        = AlpacaBroker()
+
+    # 1. 口座確認
+    acct = broker.get_account()
+    logger.info(
+        f"Alpaca口座: equity=${acct['equity']:,.2f} "
+        f"cash=${acct['cash']:,.2f} "
+        f"buying_power=${acct['buying_power']:,.2f}"
+    )
+
+    # 2. MarketContext 生成
+    logger.info("CIO: マーケットコンテキスト生成中...")
+    ctx = cio.generate_market_context(
+        news_summary="（米国株市場オープン時のコンテキスト生成）",
+        macro_data="USD/JPY=155.2, VIX=18.5, 米10Y=4.35%, S&P500先物=+0.3%",
+    )
+    logger.info(f"コンテキスト: risk={ctx.risk_level}, rotation={ctx.rotation_signal}")
+
+    if ctx.risk_level == "high":
+        logger.warning("リスク水準 HIGH のためセッションを中止します")
+        return
+
+    # 3. 米国株ユニバース構築
+    logger.info("米国株ユニバース構築中（Alpaca データ取得）...")
+    universe = us_mkt.build_us_universe(_US_BASE_SYMBOLS)
+
+    # 4. 候補銘柄スクリーニング
+    candidates = daytrade_agent.screen_candidates(universe, ctx)
+    logger.info(f"候補銘柄: {candidates}")
+    if not candidates:
+        logger.info("本日の米国株デイトレ対象なし。終了します")
+        return
+
+    # 5. 各候補の取引提案 → クリティーク → ペーパー発注
+    for symbol in candidates:
+        try:
+            quote     = us_mkt.get_quote_us(symbol)
+            bars_5min = us_mkt.get_bars_5min_us(symbol)
+            sym_name  = next((u["name"] for u in universe if u["symbol"] == symbol), symbol)
+
+            proposal = daytrade_agent.generate_trade_proposal(
+                symbol=symbol,
+                symbol_name=sym_name,
+                board_data=quote,
+                bars_5min=bars_5min,
+                ctx=ctx,
+            )
+            if not proposal:
+                continue
+
+            # クリティーク審査（ペーパーなので余力は buying_power で代替）
+            wallet = {"MarginAccountWallet": acct["buying_power"]}
+            verdict = critic.review(proposal, ctx, wallet)
+            if not verdict.approved:
+                logger.info(f"{symbol}: クリティーク否決 - {verdict.suggestion}")
+                continue
+
+            # ペーパー発注（Alpaca paper-API に実際に送信）
+            price = proposal.price
+            if price and price > 0:
+                result = broker.send_limit_order(symbol, proposal.qty, proposal.side, price)
+            else:
+                result = broker.send_market_order(symbol, proposal.qty, proposal.side)
+
+            if result.success:
+                logger.info(
+                    f"[ペーパー発注] {symbol} {proposal.side} x{proposal.qty} "
+                    f"order_id={result.order_id}"
+                )
+            else:
+                logger.warning(f"{symbol}: 発注失敗 - {result.message}")
+
+        except Exception as e:
+            logger.error(f"{symbol} 処理中エラー: {e}", exc_info=True)
+
+    logger.info("=== 米国株ペーパートレードセッション終了 ===")
+
+
+# ──────────────────────────────────────────────────
+# スケジューラー（指定時刻まで待機して実行）
+# ──────────────────────────────────────────────────
+
+def wait_until(hhmm: str) -> None:
+    """
+    指定した時刻（HH:MM、当日の日本時間）まで待機する。
+    例: wait_until("22:30")
+    """
+    h, m = int(hhmm.split(":")[0]), int(hhmm.split(":")[1])
+    now = datetime.now()
+    target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    if target <= now:
+        logger.info(f"指定時刻 {hhmm} はすでに過ぎています。即時実行します")
+        return
+    wait_sec = (target - now).seconds
+    logger.info(f"指定時刻 {hhmm} まで {wait_sec // 60} 分 {wait_sec % 60} 秒待機します...")
+    time.sleep(wait_sec)
+    logger.info(f"待機完了。{hhmm} になりました")
+
+
+# ──────────────────────────────────────────────────
 # エントリポイント
 # ──────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="マルチエージェント投資システム")
-    parser.add_argument("--mode", choices=["daytrade", "paper"], default="paper")
+    parser.add_argument(
+        "--mode",
+        choices=["daytrade", "paper", "us_paper"],
+        default="paper",
+        help="実行モード: daytrade=日本株本番, paper=日本株ペーパー, us_paper=米国株ペーパー",
+    )
+    parser.add_argument(
+        "--schedule",
+        metavar="HH:MM",
+        help="指定時刻まで待機してから実行する（例: --schedule 22:30）",
+    )
     args = parser.parse_args()
 
-    run_daytrade_session(paper=(args.mode == "paper"))
+    if args.schedule:
+        wait_until(args.schedule)
+
+    if args.mode == "us_paper":
+        run_us_paper_session()
+    else:
+        run_daytrade_session(paper=(args.mode == "paper"))
