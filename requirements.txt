@@ -1,0 +1,16 @@
+# ブローカー接続
+alpaca-py>=0.38.0
+requests>=2.32.0
+
+# LLM
+anthropic>=0.49.0
+
+# 環境変数管理
+python-dotenv>=1.0.0
+
+# データ処理（screener.py で使用）
+pandas>=2.2.0
+numpy>=2.0.0
+
+# スケジューリング（朝8時の自動起動）
+schedule>=1.2.0
