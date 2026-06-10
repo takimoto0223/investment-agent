@@ -52,7 +52,7 @@ yarn-error.log*
 *~
 .DS_Store
 
-# Logs
+# ログ（実行時に自動生成）
 logs/
 *.log
 *.log.*

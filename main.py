@@ -16,6 +16,7 @@ main.py
 """
 import argparse
 import logging
+import sys
 import time
 from datetime import datetime
 
@@ -26,11 +27,17 @@ from brokers.kabu import KabuBroker
 from config.settings import RISK
 
 # ── ログ設定 ──────────────────────────────────────
+# Windowsコンソールの文字化け対策
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
+    sys.stderr.reconfigure(encoding="utf-8")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     handlers=[
-        logging.StreamHandler(),
+        logging.StreamHandler(sys.stdout),
         logging.FileHandler("logs/session.log", encoding="utf-8"),
     ],
 )
