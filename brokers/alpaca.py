@@ -104,7 +104,7 @@ class AlpacaBroker:
         self,
         symbol: str,
         qty: float,
-        side: str,  # "buy" | "sell"
+        side: str,  # "buy"=買い | "sell"=売り
         tif: TimeInForce = TimeInForce.DAY,
     ) -> OrderResult:
         """成行注文。"""
