@@ -49,15 +49,21 @@ class CriticUSAgent(BaseAgent):
 
         # ── 即否決チェック（LLM 呼び出し前に Python で確定） ──────────
 
-        # 1. ストップロス未設定
-        if proposal.stop_loss is None:
+        # 1. ストップロス未設定（絶対価格 or pct のどちらか必須）
+        stop_loss_pct = float((proposal.extra or {}).get("stop_loss_pct", 0) or 0)
+        if proposal.stop_loss is None and not stop_loss_pct:
             self.logger.warning(f"{proposal.symbol}: ストップロス未設定のため即否決")
             return CriticVerdict(
                 approved=False,
                 score=0.0,
                 issues=["ストップロスが設定されていません（絶対禁止）"],
-                suggestion="stop_loss を設定してから再提案してください",
+                suggestion="stop_loss または stop_loss_pct を設定してから再提案してください",
             )
+
+        # pct のみの場合は絶対価格を概算（LLM プロンプト表示用）
+        effective_stop_loss = proposal.stop_loss
+        if effective_stop_loss is None and stop_loss_pct and proposal.price:
+            effective_stop_loss = round(proposal.price * (1 - stop_loss_pct), 4)
 
         # 2. 取引時間外
         if not is_us_market_hours():
@@ -97,14 +103,15 @@ class CriticUSAgent(BaseAgent):
         prompt = f"""
 ## 審査対象の取引提案
 {json.dumps({
-    "symbol":      proposal.symbol,
-    "market":      "US",
-    "side":        proposal.side,
-    "qty":         proposal.qty,
-    "price":       proposal.price,
-    "stop_loss":   proposal.stop_loss,
-    "take_profit": proposal.take_profit,
-    "rationale":   proposal.rationale,
+    "symbol":        proposal.symbol,
+    "market":        "US",
+    "side":          proposal.side,
+    "qty":           proposal.qty,
+    "price":         proposal.price,
+    "stop_loss":     effective_stop_loss,
+    "stop_loss_pct": stop_loss_pct or None,
+    "take_profit":   proposal.take_profit,
+    "rationale":     proposal.rationale,
 }, ensure_ascii=False, indent=2)}
 
 ## ドル建て評価・円換算

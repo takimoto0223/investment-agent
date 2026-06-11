@@ -38,12 +38,17 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
     sys.stderr.reconfigure(encoding="utf-8")
 
+# モード別ログファイル（並列起動時の競合回避）
+_mode_for_log = next(
+    (sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == "--mode" and i + 1 < len(sys.argv)),
+    "session",
+)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("logs/session.log", encoding="utf-8"),
+        logging.FileHandler(f"logs/{_mode_for_log}.log", encoding="utf-8"),
     ],
 )
 logger = logging.getLogger("main")
@@ -62,9 +67,36 @@ def is_trading_hours() -> bool:
     )
 
 def is_near_close() -> bool:
-    """引け30分前かどうか（強制決済タイミング）。"""
+    """日本株引け30分前かどうか。"""
     now = datetime.now()
     return now.hour == 15 and now.minute >= 0
+
+
+# ── 米国株セッション時刻ユーティリティ ─────────────────────────────
+
+def _us_session_end() -> datetime:
+    """
+    当日の米国株セッション終了時刻（JST 06:00）を返す。
+    06:00 を過ぎていたら翌日の 06:00 を返す。
+    """
+    now = datetime.now()
+    end = now.replace(hour=6, minute=0, second=0, microsecond=0)
+    if now >= end:
+        from datetime import timedelta
+        end += timedelta(days=1)
+    return end
+
+def is_near_us_close() -> bool:
+    """米国株引け前 30 分以内かどうか（JST 05:30 以降）。"""
+    now = datetime.now()
+    h, m = now.hour, now.minute
+    return (h == 5 and m >= 30) or h == 6
+
+def is_us_session_active() -> bool:
+    """米国株の取引セッション中かどうか（JST 22:00〜06:00）。"""
+    now = datetime.now()
+    h = now.hour
+    return h >= 22 or h < 6
 
 
 # ──────────────────────────────────────────────────
@@ -200,7 +232,7 @@ def run_daytrade_session(paper: bool = True):
 # 米国株ペーパートレードセッション
 # ──────────────────────────────────────────────────
 
-# テスト対象の米国株ユニバース（AI・半導体・テック中心）
+# デイトレ対象ユニバース（モメンタム・出来高重視）
 _US_BASE_SYMBOLS = [
     {"symbol": "NVDA",  "name": "エヌビディア"},
     {"symbol": "AAPL",  "name": "アップル"},
@@ -211,18 +243,223 @@ _US_BASE_SYMBOLS = [
     {"symbol": "GOOGL", "name": "アルファベット"},
 ]
 
+# バリュー投資ユニバース（中長期保有候補、セクター分散）
+_US_VALUE_UNIVERSE = [
+    {"symbol": "NVDA",  "name": "NVIDIA",           "sector": "semiconductors"},
+    {"symbol": "MSFT",  "name": "Microsoft",        "sector": "software"},
+    {"symbol": "AAPL",  "name": "Apple",            "sector": "consumer_tech"},
+    {"symbol": "GOOGL", "name": "Alphabet",         "sector": "internet"},
+    {"symbol": "META",  "name": "Meta",             "sector": "internet"},
+    {"symbol": "AMZN",  "name": "Amazon",           "sector": "ecommerce_cloud"},
+    {"symbol": "AMD",   "name": "AMD",              "sector": "semiconductors"},
+    {"symbol": "AVGO",  "name": "Broadcom",         "sector": "semiconductors"},
+    {"symbol": "ORCL",  "name": "Oracle",           "sector": "software"},
+    {"symbol": "CRM",   "name": "Salesforce",       "sector": "software"},
+    {"symbol": "JPM",   "name": "JPMorgan Chase",   "sector": "financials"},
+    {"symbol": "UNH",   "name": "UnitedHealth",     "sector": "healthcare"},
+    {"symbol": "PG",    "name": "Procter & Gamble", "sector": "consumer_staples"},
+    {"symbol": "KO",    "name": "Coca-Cola",        "sector": "consumer_staples"},
+    {"symbol": "XOM",   "name": "ExxonMobil",       "sector": "energy"},
+]
+
+
+def run_us_value_session():
+    """
+    米国株バリュー投資セッション（毎日22:00 JST想定）。
+    USEquityAgent で中長期保有候補を選定 → パネル議論 → CriticUS審査 → Alpaca発注。
+    結果は logs/us_value_log.json に保存する。
+    """
+    import json as _json
+    from pathlib import Path
+    from datetime import datetime as _dt
+    from brokers.alpaca import AlpacaBroker
+    from agents.us_equity import USEquityAgent
+    from agents.critic_us import CriticUSAgent
+    from agents.fx_strategy import FXStrategyAgent
+    from config.settings import RISK
+
+    logger.info("=== 米国株バリュー投資セッション開始 ===")
+
+    broker = AlpacaBroker()
+    acct = broker.get_account()
+    cash_usd = float(acct.get("cash", 0))
+    logger.info(
+        f"Alpaca口座: equity=${float(acct.get('equity',0)):,.2f} "
+        f"cash=${cash_usd:,.2f}"
+    )
+
+    if cash_usd < 200:
+        logger.info("買い付け余力不足（$200未満）。セッション終了")
+        return
+
+    # MarketContext
+    cio = CIOAgent()
+    macro_data = "USD/JPY=155.2, VIX=18.5, 米10Y=4.35%"
+    ctx = cio.generate_market_context(
+        news_summary="（バリュー投資セッション）",
+        macro_data=macro_data,
+    )
+    logger.info(f"コンテキスト: risk={ctx.risk_level}, rotation={ctx.rotation_signal}")
+
+    # FXシグナル
+    fx_agent = FXStrategyAgent()
+    fx_signal = fx_agent.generate_signal(macro_data, 0.35, ctx)
+
+    # 既存ポジション
+    existing_positions = broker.get_positions()
+    existing_symbols = [p.get("symbol", "") for p in existing_positions]
+    logger.info(f"既存ポジション: {existing_symbols}")
+
+    # バリュー候補スクリーニング
+    max_pos_usd = float(getattr(RISK, "max_us_position_usd", 3000))
+    us_equity = USEquityAgent()
+    proposals = us_equity.screen_value(
+        universe=_US_VALUE_UNIVERSE,
+        ctx=ctx,
+        existing_symbols=existing_symbols,
+        max_position_usd=max_pos_usd,
+        cash_usd=cash_usd,
+    )
+    logger.info(f"バリュー候補提案数: {len(proposals)}")
+
+    if not proposals:
+        logger.info("バリュー投資候補なし。セッション終了")
+        _save_us_value_log([], cash_usd, ctx.risk_level)
+        return
+
+    critic = CriticUSAgent()
+    executed: list[dict] = []
+    rejected: list[dict] = []
+
+    for proposal in proposals:
+        logger.info(f"審議開始: {proposal.symbol} — {proposal.rationale}")
+
+        # パネル議論（CIO・FX・リスク視点）
+        risk_notes = f"既存ポジション数: {len(existing_symbols)}, 現金: ${cash_usd:,.0f}"
+        panel = us_equity.panel_review(proposal, ctx, fx_signal, risk_notes)
+        consensus = panel.get("consensus", "defer")
+        logger.info(
+            f"  CIO:{panel['cio_opinion']} FX:{panel['fx_opinion']} "
+            f"Risk:{panel['risk_opinion']} → {consensus}"
+        )
+        logger.info(f"  議論結論: {panel.get('consensus_reason', '')}")
+
+        if consensus == "reject":
+            logger.info(f"{proposal.symbol}: パネル議論で否決")
+            rejected.append({"symbol": proposal.symbol, "reason": panel.get("consensus_reason", "")})
+            continue
+
+        # CriticUS最終審査
+        critic_verdict = critic.review(proposal, ctx, acct, fx_signal)
+        if not critic_verdict.approved:
+            logger.info(f"{proposal.symbol}: CriticUS否決 — {critic_verdict.suggestion}")
+            rejected.append({"symbol": proposal.symbol, "reason": critic_verdict.suggestion})
+            continue
+
+        # 成行発注
+        result = broker.send_market_order(proposal.symbol, proposal.qty, "buy")
+        if result.success:
+            logger.info(
+                f"[バリュー買い] {proposal.symbol} x{proposal.qty} "
+                f"order_id={result.order_id}"
+            )
+            executed.append({
+                "symbol":     proposal.symbol,
+                "name":       proposal.extra.get("name", proposal.symbol),
+                "qty":        proposal.qty,
+                "rationale":  proposal.rationale,
+                "order_id":   result.order_id,
+                "consensus":  consensus,
+                "stop_loss_pct":       proposal.extra.get("stop_loss_pct", 0.08),
+                "target_return_pct":   proposal.extra.get("target_return_pct", 0.15),
+            })
+        else:
+            logger.warning(f"{proposal.symbol}: 発注失敗 — {result.message}")
+            rejected.append({"symbol": proposal.symbol, "reason": result.message})
+
+    _save_us_value_log(executed, cash_usd, ctx.risk_level, rejected)
+
+    # ── バリューポジション監視ループ（6時まで、ポジションは閉じない） ──
+    if not executed:
+        logger.info("=== 米国株バリュー投資セッション終了（発注なし） ===")
+        return
+
+    # 銘柄ごとのストップロス率を記録
+    stop_loss_map = {e["symbol"]: e.get("stop_loss_pct", 0.08) for e in executed}
+    session_end   = _us_session_end()
+    logger.info(f"バリューポジション監視開始（{session_end.strftime('%H:%M')}まで）: {list(stop_loss_map.keys())}")
+
+    while datetime.now() < session_end:
+        time.sleep(1800)  # 30分ごとチェック
+        try:
+            positions = broker.get_positions()
+            pos_map   = {p["symbol"]: p for p in positions}
+            for symbol, sl_pct in list(stop_loss_map.items()):
+                pos = pos_map.get(symbol)
+                if not pos:
+                    continue
+                entry   = float(pos["avg_entry_price"])
+                current = float(pos["current_price"])
+                chg     = (current - entry) / entry if entry > 0 else 0.0
+                unpl    = float(pos["unrealized_pl"])
+                logger.info(f"  {symbol}: {chg:+.2%} 含み損益 ${unpl:+.2f}")
+                if chg <= -sl_pct:
+                    logger.warning(f"バリューSL発動: {symbol} {chg:+.2%}（設定SL:{sl_pct:.0%}）→ 売却")
+                    broker.close_position(symbol)
+                    del stop_loss_map[symbol]
+        except Exception as e:
+            logger.error(f"バリュー監視エラー: {e}")
+
+    logger.info(f"=== 米国株バリュー投資セッション終了: 発注{len(executed)}件 ===")
+
+
+def _save_us_value_log(
+    executed: list[dict],
+    cash_usd: float,
+    risk_level: str,
+    rejected: list[dict] | None = None,
+) -> None:
+    import json as _json
+    from pathlib import Path
+    from datetime import datetime as _dt
+
+    log_path = Path("logs/us_value_log.json")
+    log_path.parent.mkdir(exist_ok=True)
+    existing: list[dict] = []
+    if log_path.exists():
+        try:
+            existing = _json.loads(log_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    existing.append({
+        "session_date": _dt.now().isoformat(),
+        "risk_level":   risk_level,
+        "cash_usd":     cash_usd,
+        "executed":     executed,
+        "rejected":     rejected or [],
+    })
+    log_path.write_text(
+        _json.dumps(existing[-30:], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logger.info(f"バリューログ保存: {log_path}")
+
 
 def run_us_paper_session():
     """
-    米国株ペーパートレードセッション。
+    米国株デイトレペーパーセッション（毎日22:30 JST想定）。
     Alpaca paper-API に接続し、エージェントの提案を実際にペーパー発注する。
+    結果は logs/us_daytrade_log.json に保存する。
     """
+    import json as _json
+    from pathlib import Path
+    from datetime import datetime as _dt
     from brokers.alpaca import AlpacaBroker
     from data import us_market as us_mkt
     from agents.critic_us import CriticUSAgent
     from agents.fx_strategy import FXStrategyAgent
 
-    logger.info("=== 米国株ペーパートレードセッション開始 ===")
+    logger.info("=== 米国株デイトレセッション開始 ===")
 
     cio            = CIOAgent()
     daytrade_agent = DaytradeAgent()
@@ -233,45 +470,51 @@ def run_us_paper_session():
     # 1. 口座確認
     acct = broker.get_account()
     logger.info(
-        f"Alpaca口座: equity=${acct['equity']:,.2f} "
-        f"cash=${acct['cash']:,.2f} "
-        f"buying_power=${acct['buying_power']:,.2f}"
+        f"Alpaca口座: equity=${float(acct.get('equity',0)):,.2f} "
+        f"cash=${float(acct.get('cash',0)):,.2f} "
+        f"buying_power=${float(acct.get('buying_power',0)):,.2f}"
     )
 
     # 2. MarketContext 生成
     logger.info("CIO: マーケットコンテキスト生成中...")
     macro_data = "USD/JPY=155.2, VIX=18.5, 米10Y=4.35%, S&P500先物=+0.3%"
     ctx = cio.generate_market_context(
-        news_summary="（米国株市場オープン時のコンテキスト生成）",
+        news_summary="（米国株デイトレセッション）",
         macro_data=macro_data,
     )
     logger.info(f"コンテキスト: risk={ctx.risk_level}, rotation={ctx.rotation_signal}")
 
     if ctx.risk_level == "high":
         logger.warning("リスク水準 HIGH のためセッションを中止します")
+        _save_us_daytrade_log([], ctx.risk_level, "high_risk_abort")
         return
 
-    # 3. FX シグナル取得（クリティークに渡す）
+    # 3. FX シグナル
     logger.info("FX戦略シグナル取得中...")
-    current_usd_ratio = acct["equity"] / (acct["equity"] * 155.0 + 1) * 100  # 概算
-    fx_signal = fx_agent.generate_signal(macro_data, current_usd_ratio / 100, ctx)
+    fx_signal = fx_agent.generate_signal(macro_data, 0.35, ctx)
     logger.info(
         f"FXシグナル: {fx_signal.get('fx_signal')} "
         f"us_weight_bias={fx_signal.get('us_weight_bias')}"
     )
 
-    # 4. 米国株ユニバース構築
-    logger.info("米国株ユニバース構築中（Alpaca データ取得）...")
-    universe = us_mkt.build_us_universe(_US_BASE_SYMBOLS)
+    # 4. バリューポジション銘柄を除外（デイトレ対象から外す）
+    value_positions = {p.get("symbol") for p in broker.get_positions()}
 
-    # 5. 候補銘柄スクリーニング
-    candidates = daytrade_agent.screen_candidates(universe, ctx)
-    logger.info(f"候補銘柄: {candidates}")
+    # 5. ユニバース構築・スクリーニング
+    logger.info("米国株ユニバース構築中...")
+    universe = us_mkt.build_us_universe(_US_BASE_SYMBOLS)
+    candidates = [c for c in daytrade_agent.screen_candidates(universe, ctx)
+                  if c not in value_positions]
+    logger.info(f"デイトレ候補銘柄: {candidates}")
     if not candidates:
-        logger.info("本日の米国株デイトレ対象なし。終了します")
+        logger.info("本日のデイトレ対象なし。終了します")
+        _save_us_daytrade_log([], ctx.risk_level, "no_candidates")
         return
 
-    # 6. 各候補の取引提案 → CriticUSAgent → ペーパー発注
+    # 6. 各候補: 提案 → CriticUS → ペーパー発注
+    executed: list[dict] = []
+    rejected: list[dict] = []
+
     for symbol in candidates:
         try:
             quote     = us_mkt.get_quote_us(symbol)
@@ -288,31 +531,130 @@ def run_us_paper_session():
             if not proposal:
                 continue
 
-            # CriticUSAgent で審査（FXシグナル・ドル建て大口判定・市場時間チェック含む）
+            # USD建て株数を max_us_position_usd 上限で再計算
+            # DaytradeAgent の qty は JPY 前提なので USD 銘柄には使えない
+            max_pos_usd = float(getattr(RISK, "max_us_position_usd", 3000))
+            current_price_usd = quote.get("CurrentPrice", 0)
+            if current_price_usd > 0:
+                proposal.qty = max(1, int(max_pos_usd / current_price_usd))
+
+            # stop_loss が未設定なら ATR × 1.5 で補完
+            if proposal.stop_loss is None and current_price_usd > 0:
+                uni_item = next((u for u in universe if u["symbol"] == symbol), {})
+                atr_pct = float(uni_item.get("atr_pct", 2.0))
+                sl_price = round(current_price_usd * (1 - 1.5 * atr_pct / 100), 4)
+                proposal.stop_loss = sl_price
+                logger.info(f"{symbol}: ATRベースstop_loss={sl_price:.4f} (ATR={atr_pct:.2f}%)")
+
             verdict = critic.review(proposal, ctx, acct, fx_signal)
             if not verdict.approved:
-                logger.info(f"{symbol}: クリティーク否決 - {verdict.suggestion}")
+                logger.info(f"{symbol}: クリティーク否決 — {verdict.suggestion}")
+                rejected.append({"symbol": symbol, "reason": verdict.suggestion})
                 continue
 
-            # ペーパー発注（Alpaca paper-API に実際に送信）
-            price = proposal.price
-            if price and price > 0:
-                result = broker.send_limit_order(symbol, proposal.qty, proposal.side, price)
+            # ペーパー発注
+            if proposal.price and proposal.price > 0:
+                result = broker.send_limit_order(symbol, proposal.qty, proposal.side, proposal.price)
             else:
                 result = broker.send_market_order(symbol, proposal.qty, proposal.side)
 
             if result.success:
                 logger.info(
-                    f"[ペーパー発注] {symbol} {proposal.side} x{proposal.qty} "
+                    f"[デイトレ発注] {symbol} {proposal.side} x{proposal.qty} "
                     f"order_id={result.order_id}"
                 )
+                executed.append({
+                    "symbol":    symbol,
+                    "name":      sym_name,
+                    "side":      proposal.side,
+                    "qty":       proposal.qty,
+                    "rationale": proposal.rationale,
+                    "order_id":  result.order_id,
+                })
             else:
-                logger.warning(f"{symbol}: 発注失敗 - {result.message}")
+                logger.warning(f"{symbol}: 発注失敗 — {result.message}")
+                rejected.append({"symbol": symbol, "reason": result.message})
 
         except Exception as e:
             logger.error(f"{symbol} 処理中エラー: {e}", exc_info=True)
 
-    logger.info("=== 米国株ペーパートレードセッション終了 ===")
+    _save_us_daytrade_log(executed, ctx.risk_level, "orders_sent", rejected)
+
+    # ── ポジション監視ループ（引けまで） ──────────────────────────
+    daytrade_symbols: set[str] = {e["symbol"] for e in executed}
+    _STOP_LOSS_PCT  = -0.015   # -1.5% で損切り
+    _TAKE_PROFIT_PCT = 0.025   # +2.5% で利確
+
+    logger.info(f"監視ループ開始: {daytrade_symbols} （引けまで継続）")
+    while daytrade_symbols and not is_near_us_close():
+        time.sleep(120)  # 2分ごとチェック
+        try:
+            positions = broker.get_positions()
+            pos_map   = {p["symbol"]: p for p in positions}
+            for symbol in list(daytrade_symbols):
+                pos = pos_map.get(symbol)
+                if not pos:
+                    daytrade_symbols.discard(symbol)
+                    continue
+                entry   = float(pos["avg_entry_price"])
+                current = float(pos["current_price"])
+                chg     = (current - entry) / entry if entry > 0 else 0.0
+                if chg <= _STOP_LOSS_PCT:
+                    logger.warning(f"損切り: {symbol} {chg:+.2%} → 全決済")
+                    broker.close_position(symbol)
+                    daytrade_symbols.discard(symbol)
+                elif chg >= _TAKE_PROFIT_PCT:
+                    logger.info(f"利確: {symbol} {chg:+.2%} → 全決済")
+                    broker.close_position(symbol)
+                    daytrade_symbols.discard(symbol)
+        except Exception as e:
+            logger.error(f"監視ループエラー: {e}")
+
+    # 引け前強制決済（デイトレポジションのみ）
+    logger.info("引け前強制決済フェーズ")
+    for symbol in list(daytrade_symbols):
+        try:
+            positions = broker.get_positions()
+            if any(p["symbol"] == symbol for p in positions):
+                logger.info(f"引け強制決済: {symbol}")
+                broker.close_position(symbol)
+        except Exception as e:
+            logger.error(f"引け決済エラー {symbol}: {e}")
+
+    _save_us_daytrade_log(executed, ctx.risk_level, "completed", rejected)
+    logger.info(f"=== 米国株デイトレセッション終了: 発注{len(executed)}件 ===")
+
+
+def _save_us_daytrade_log(
+    executed: list[dict],
+    risk_level: str,
+    status: str,
+    rejected: list[dict] | None = None,
+) -> None:
+    import json as _json
+    from pathlib import Path
+    from datetime import datetime as _dt
+
+    log_path = Path("logs/us_daytrade_log.json")
+    log_path.parent.mkdir(exist_ok=True)
+    existing: list[dict] = []
+    if log_path.exists():
+        try:
+            existing = _json.loads(log_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    existing.append({
+        "session_date": _dt.now().isoformat(),
+        "risk_level":   risk_level,
+        "status":       status,
+        "executed":     executed,
+        "rejected":     rejected or [],
+    })
+    log_path.write_text(
+        _json.dumps(existing[-30:], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logger.info(f"デイトレログ保存: {log_path}")
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -430,7 +772,45 @@ def run_intelligence_session():
             f"  [{result.get('verdict', '?')}] {result.get('signal_title', '')[:60]}"
         )
 
-    logger.info("=== インテリジェンスセッション終了 ===")
+    logger.info("=== インテリジェンスセッション（初回）終了 ===")
+
+    # 2時間ごとに再収集（6時まで）
+    session_end = _us_session_end()
+    while datetime.now() < session_end:
+        wait_sec = min(7200, int((session_end - datetime.now()).total_seconds()))
+        if wait_sec < 600:
+            break
+        logger.info(f"次回インテリジェンス収集まで {wait_sec // 60} 分待機...")
+        time.sleep(wait_sec if wait_sec <= 7200 else 7200)
+        if datetime.now() >= session_end:
+            break
+        logger.info("=== インテリジェンス再収集 ===")
+        try:
+            raw_result  = intel_agent.collect(ctx)
+            raw_signals = raw_result.get("signals", [])
+            logger.info(f"再収集シグナル数: {len(raw_signals)} 件")
+            approved    = critic_intel.review(raw_signals, ctx)
+            high_score  = [s for s in approved if s.get("relevance_score", 0) >= 0.75]
+            for signal in high_score:
+                result = discussion.run(signal, ctx, cio_agent=cio,
+                                        equity_agent=equity, fx_agent=fx, risk_agent=risk)
+                discussion_results.append(result)
+            # ログ追記保存（既存セッションを更新）
+            log_path = Path("logs/discussion_log.json")
+            existing = []
+            if log_path.exists():
+                try:
+                    existing = _json.loads(log_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            if existing:
+                existing[-1]["discussions"].extend(discussion_results[-len(high_score):])
+                existing[-1]["signals_found"] += len(raw_signals)
+            log_path.write_text(_json.dumps(existing[-30:], ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.error(f"インテリジェンス再収集エラー: {e}")
+
+    logger.info("=== インテリジェンスセッション終了（全サイクル完了） ===")
 
 
 def run_morning_report() -> str:
@@ -518,13 +898,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         choices=[
-            "daytrade", "paper", "us_paper",
+            "daytrade", "paper", "us_paper", "us_value",
             "intelligence", "morning_report", "evening_report",
         ],
         default="paper",
         help=(
             "実行モード: daytrade=日本株本番, paper=日本株ペーパー, "
-            "us_paper=米国株ペーパー, intelligence=情報収集・議論, "
+            "us_paper=米国株デイトレ, us_value=米国株バリュー中長期, "
+            "intelligence=情報収集・議論, "
             "morning_report=朝次レポート(06:00), evening_report=夜間レポート(21:00)"
         ),
     )
@@ -538,7 +919,9 @@ if __name__ == "__main__":
     if args.schedule:
         wait_until(args.schedule)
 
-    if args.mode == "us_paper":
+    if args.mode == "us_value":
+        run_us_value_session()
+    elif args.mode == "us_paper":
         run_us_paper_session()
     elif args.mode == "intelligence":
         run_intelligence_session()
