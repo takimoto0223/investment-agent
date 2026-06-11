@@ -30,6 +30,7 @@ def is_us_market_hours() -> bool:
 class CriticUSAgent(BaseAgent):
     name = "CriticUSAgent"
     system_prompt = get_prompt("critic_us")
+    model = "claude-opus-4-8"  # 発注最終判断者。ケチな節約より判断精度を優先
 
     def review(
         self,
@@ -77,6 +78,7 @@ class CriticUSAgent(BaseAgent):
                 score=0.0,
                 issues=[f"米国市場時間外です（ET {now_et.strftime('%H:%M')}）"],
                 suggestion="ET 9:30〜16:00 の時間帯に再提案してください",
+                fixable=False,
             )
 
         # 3. FX 整合性（underweight × buy は即否決）

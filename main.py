@@ -263,6 +263,57 @@ _US_VALUE_UNIVERSE = [
 ]
 
 
+def _refine_and_review(
+    proposer,
+    proposal,
+    critic,
+    ctx,
+    acct: dict,
+    fx_signal: dict,
+    max_rounds: int = 2,
+) -> tuple:
+    """
+    提案 → CriticUS審査 → 否決なら提案者に修正依頼 → 再審査 のループ。
+    (最終proposal, 最終verdict) を返す。
+
+    - 市場時間外など fixable=False の否決は即打ち切り
+    - proposer が revise_proposal() を持たない場合もそのまま返す
+    """
+    from agents.base import CriticVerdict
+
+    for round_n in range(1, max_rounds + 1):
+        verdict = critic.review(proposal, ctx, acct, fx_signal)
+        if verdict.approved:
+            if round_n > 1:
+                logger.info(f"[{proposal.symbol}] Round {round_n}: 修正後に承認")
+            return proposal, verdict
+
+        logger.info(
+            f"[{proposal.symbol}] Round {round_n} 否決 — "
+            f"{', '.join(verdict.issues[:2])}"
+        )
+
+        if not verdict.fixable:
+            logger.info(f"[{proposal.symbol}] 修正不能（fixable=False）→ 終了")
+            return proposal, verdict
+
+        if not hasattr(proposer, "revise_proposal"):
+            return proposal, verdict
+
+        revised = proposer.revise_proposal(
+            proposal, verdict.issues, verdict.suggestion, ctx
+        )
+        if revised is None:
+            logger.info(f"[{proposal.symbol}] 提案者が修正断念 → 否決確定")
+            return proposal, verdict
+
+        proposal = revised
+
+    # max_rounds 消化後の最終審査
+    verdict = critic.review(proposal, ctx, acct, fx_signal)
+    return proposal, verdict
+
+
 def run_us_value_session():
     """
     米国株バリュー投資セッション（毎日22:00 JST想定）。
@@ -349,10 +400,12 @@ def run_us_value_session():
             rejected.append({"symbol": proposal.symbol, "reason": panel.get("consensus_reason", "")})
             continue
 
-        # CriticUS最終審査
-        critic_verdict = critic.review(proposal, ctx, acct, fx_signal)
+        # CriticUS最終審査（否決なら us_equity に修正依頼して再審査）
+        proposal, critic_verdict = _refine_and_review(
+            us_equity, proposal, critic, ctx, acct, fx_signal
+        )
         if not critic_verdict.approved:
-            logger.info(f"{proposal.symbol}: CriticUS否決 — {critic_verdict.suggestion}")
+            logger.info(f"{proposal.symbol}: CriticUS最終否決 — {critic_verdict.suggestion}")
             rejected.append({"symbol": proposal.symbol, "reason": critic_verdict.suggestion})
             continue
 
@@ -546,9 +599,12 @@ def run_us_paper_session():
                 proposal.stop_loss = sl_price
                 logger.info(f"{symbol}: ATRベースstop_loss={sl_price:.4f} (ATR={atr_pct:.2f}%)")
 
-            verdict = critic.review(proposal, ctx, acct, fx_signal)
+            # CriticUS審査（否決なら daytrade_agent に修正依頼して再審査）
+            proposal, verdict = _refine_and_review(
+                daytrade_agent, proposal, critic, ctx, acct, fx_signal
+            )
             if not verdict.approved:
-                logger.info(f"{symbol}: クリティーク否決 — {verdict.suggestion}")
+                logger.info(f"{symbol}: クリティーク最終否決 — {verdict.suggestion}")
                 rejected.append({"symbol": symbol, "reason": verdict.suggestion})
                 continue
 

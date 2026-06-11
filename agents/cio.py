@@ -35,6 +35,7 @@ SYSTEM_PROMPT = """
 class CIOAgent(BaseAgent):
     name = "CIOAgent"
     system_prompt = SYSTEM_PROMPT
+    model = "claude-opus-4-8"  # 全エージェントの羅針盤となる上位職
 
     def generate_market_context(self, news_summary: str = "", macro_data: str = "") -> MarketContext:
         """

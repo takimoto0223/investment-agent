@@ -56,6 +56,7 @@ class CriticVerdict:
     score: float                       # 0.0〜1.0 (確信度)
     issues: list[str]                  # 否決・修正が必要な理由
     suggestion: str                    # 修正案または「問題なし」
+    fixable: bool = True               # False=修正しても無意味（市場時間外など）
 
 
 # ──────────────────────────────────────────────
@@ -69,6 +70,7 @@ class BaseAgent:
     """
     name: str = "BaseAgent"
     system_prompt: str = "あなたはプロの投資家です。"
+    model: str | None = None  # None = LLM.model を使用。上位職はサブクラスで "claude-opus-4-8" 等に上書き
 
     def __init__(self):
         self.logger = logging.getLogger(self.name)
@@ -83,7 +85,7 @@ class BaseAgent:
             system = f"{system}\n\n{extra_system}"
 
         response = _client.messages.create(
-            model=LLM.model,
+            model=self.model or LLM.model,
             max_tokens=LLM.max_tokens,
             system=system,
             messages=[{"role": "user", "content": user_message}],

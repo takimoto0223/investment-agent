@@ -131,6 +131,72 @@ class DaytradeAgent(BaseAgent):
         self._log_proposal(proposal)
         return proposal
 
+    def revise_proposal(
+        self,
+        proposal: "TradeProposal",
+        issues: list[str],
+        suggestion: str,
+        ctx: "MarketContext",
+    ) -> "TradeProposal | None":
+        """
+        CriticUS の指摘を受けて提案を修正する。
+        修正不能と判断した場合は None を返す。
+        """
+        from dataclasses import asdict
+        prop_dict = {
+            "symbol":      proposal.symbol,
+            "side":        proposal.side,
+            "qty":         proposal.qty,
+            "price":       proposal.price,
+            "stop_loss":   proposal.stop_loss,
+            "take_profit": proposal.take_profit,
+            "rationale":   proposal.rationale,
+        }
+        prompt = f"""
+あなたがデイトレ提案を出したところ、審査担当（CriticUSAgent・Opusモデル）から以下の指摘を受けました。
+指摘を真摯に受け止め、修正した提案を返してください。
+
+## あなたの元の提案
+{json.dumps(prop_dict, ensure_ascii=False, indent=2)}
+
+## 審査担当の指摘
+{json.dumps(issues, ensure_ascii=False)}
+
+## 修正案の提示
+{suggestion}
+
+## 修正の注意点
+- qty（株数）はドル建て上限 ${RISK.max_us_position_usd:,} ÷ 現在値で計算してください
+- stop_loss は必ず設定してください（建値から ATR×1.5 以上離すこと）
+- R:R = (take_profit - price) / (price - stop_loss) が 0.75 以上になるようにしてください
+- 修正が不可能な場合（根本的に機会なし）は {{"action": "withdraw"}} を返してください
+
+修正後の提案:
+{{
+  "action": "buy" | "sell" | "withdraw",
+  "qty": 整数,
+  "price": 指値価格（0=成行）,
+  "stop_loss": ストップロス価格,
+  "take_profit": 利確目標価格,
+  "rationale": "修正後の根拠（80文字以内）"
+}}
+"""
+        data = self._ask_llm_json(prompt)
+        if not data or data.get("action") == "withdraw":
+            self.logger.info(f"{proposal.symbol}: 修正断念（CriticUS指摘を解消できず）")
+            return None
+
+        proposal.qty         = int(data.get("qty",         proposal.qty))
+        proposal.price       = float(data.get("price",       proposal.price))
+        proposal.stop_loss   = data.get("stop_loss",   proposal.stop_loss)
+        proposal.take_profit = data.get("take_profit", proposal.take_profit)
+        proposal.rationale   = data.get("rationale",   proposal.rationale)
+        self.logger.info(
+            f"{proposal.symbol}: 提案修正完了 qty={proposal.qty} "
+            f"stop_loss={proposal.stop_loss}"
+        )
+        return proposal
+
     def should_emergency_exit(self, position: dict, current_price: float) -> bool:
         """
         ポジション保有中に強制決済すべきか判定する（損切り監視用）。
