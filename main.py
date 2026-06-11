@@ -378,6 +378,26 @@ def run_us_value_session():
         _save_us_value_log([], cash_usd, ctx.risk_level)
         return
 
+    # ── 価格補完（CriticUSが price=0 を即否決するため、審査前に現在値を取得） ──
+    from data import us_market as us_mkt
+    for proposal in proposals:
+        try:
+            quote = us_mkt.get_quote_us(proposal.symbol)
+            current_price = float(quote.get("CurrentPrice", 0))
+            if current_price > 0:
+                sl_pct  = proposal.extra.get("stop_loss_pct",    0.08)
+                tp_pct  = proposal.extra.get("target_return_pct", 0.15)
+                proposal.price       = current_price
+                proposal.qty         = max(1, int(max_pos_usd / current_price))
+                proposal.stop_loss   = round(current_price * (1 - sl_pct), 4)
+                proposal.take_profit = round(current_price * (1 + tp_pct), 4)
+                logger.info(
+                    f"{proposal.symbol}: 価格補完 ${current_price:.2f} "
+                    f"SL=${proposal.stop_loss:.2f} TP=${proposal.take_profit:.2f} qty={proposal.qty}"
+                )
+        except Exception as e:
+            logger.warning(f"{proposal.symbol}: 価格補完失敗 {e}")
+
     critic = CriticUSAgent()
     executed: list[dict] = []
     rejected: list[dict] = []

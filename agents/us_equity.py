@@ -154,12 +154,18 @@ class USEquityAgent(BaseAgent):
             return None
 
         proposal.qty = max(1, int(data.get("qty", proposal.qty)))
-        proposal.extra["stop_loss_pct"]     = float(data.get("stop_loss_pct",    proposal.extra.get("stop_loss_pct", 0.08)))
-        proposal.extra["target_return_pct"] = float(data.get("target_return_pct", proposal.extra.get("target_return_pct", 0.15)))
+        sl_pct = float(data.get("stop_loss_pct",    proposal.extra.get("stop_loss_pct", 0.08)))
+        tp_pct = float(data.get("target_return_pct", proposal.extra.get("target_return_pct", 0.15)))
+        proposal.extra["stop_loss_pct"]     = sl_pct
+        proposal.extra["target_return_pct"] = tp_pct
         proposal.rationale = data.get("rationale", proposal.rationale)
+        # price が確定している場合は絶対価格も更新
+        if proposal.price and proposal.price > 0:
+            proposal.stop_loss   = round(proposal.price * (1 - sl_pct), 4)
+            proposal.take_profit = round(proposal.price * (1 + tp_pct), 4)
         self.logger.info(
             f"{proposal.symbol}: バリュー提案修正完了 qty={proposal.qty} "
-            f"stop_loss_pct={proposal.extra['stop_loss_pct']:.0%}"
+            f"SL=${proposal.stop_loss} TP=${proposal.take_profit}"
         )
         return proposal
 
