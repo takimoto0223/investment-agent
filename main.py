@@ -11,10 +11,12 @@ main.py
   6. 引け前に全ポジション強制決済
 
 実行コマンド:
-  python main.py --mode daytrade       # 日本株デイトレセッション
-  python main.py --mode paper          # ペーパートレード（発注しない）
-  python main.py --mode us_paper       # 米国株ペーパートレード（Alpaca）
-  python main.py --mode intelligence   # 情報収集・議論セッション（毎日 23:00 想定）
+  python main.py --mode daytrade         # 日本株デイトレセッション
+  python main.py --mode paper            # ペーパートレード（発注しない）
+  python main.py --mode us_paper         # 米国株ペーパートレード（Alpaca）
+  python main.py --mode intelligence     # 情報収集・議論セッション（毎日 23:00 想定）
+  python main.py --mode morning_report   # 朝次レポート生成＋メール送信（06:00 想定）
+  python main.py --mode evening_report   # 夜間レポート生成＋メール送信（21:00 想定）
 """
 import argparse
 import logging
@@ -433,10 +435,13 @@ def run_intelligence_session():
 
 def run_morning_report() -> str:
     """
-    朝 6 時レポート：直近のインテリジェンス議論サマリーを含む日次レポートを生成する。
+    朝 6 時レポート：
+    1. テキストサマリーをログ出力
+    2. CxOAgent でHTMLレポートを生成してメール送信
     """
     import json as _json
     from pathlib import Path
+    from agents.cxo import CXOAgent
 
     lines = [f"=== 朝次レポート {datetime.now().strftime('%Y-%m-%d %H:%M')} ==="]
 
@@ -461,7 +466,26 @@ def run_morning_report() -> str:
 
     report = "\n".join(lines)
     logger.info(report)
+
+    # HTMLレポートをメール送信
+    try:
+        CXOAgent().generate_morning_report()
+    except Exception as exc:
+        logger.error(f"朝次HTMLレポート送信失敗: {exc}", exc_info=True)
+
     return report
+
+
+def run_evening_report() -> None:
+    """
+    夜 21 時レポート：CxOAgent でHTMLレポートを生成してメール送信する。
+    """
+    from agents.cxo import CXOAgent
+    logger.info("=== 夜間レポート生成開始 ===")
+    try:
+        CXOAgent().generate_evening_report()
+    except Exception as exc:
+        logger.error(f"夜間HTMLレポート送信失敗: {exc}", exc_info=True)
 
 
 # ──────────────────────────────────────────────────
@@ -493,12 +517,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="マルチエージェント投資システム")
     parser.add_argument(
         "--mode",
-        choices=["daytrade", "paper", "us_paper", "intelligence", "morning_report"],
+        choices=[
+            "daytrade", "paper", "us_paper",
+            "intelligence", "morning_report", "evening_report",
+        ],
         default="paper",
         help=(
             "実行モード: daytrade=日本株本番, paper=日本株ペーパー, "
             "us_paper=米国株ペーパー, intelligence=情報収集・議論, "
-            "morning_report=朝次レポート"
+            "morning_report=朝次レポート(06:00), evening_report=夜間レポート(21:00)"
         ),
     )
     parser.add_argument(
@@ -517,5 +544,7 @@ if __name__ == "__main__":
         run_intelligence_session()
     elif args.mode == "morning_report":
         run_morning_report()
+    elif args.mode == "evening_report":
+        run_evening_report()
     else:
         run_daytrade_session(paper=(args.mode == "paper"))
