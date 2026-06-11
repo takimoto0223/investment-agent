@@ -12,6 +12,7 @@ from prompts.loader import get_prompt
 class CriticFXAgent(BaseAgent):
     name = "CriticFXAgent"
     system_prompt = get_prompt("critic_fx")
+    model = "claude-opus-4-8"
 
     def review(
         self,

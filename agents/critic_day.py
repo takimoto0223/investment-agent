@@ -14,6 +14,7 @@ from config.settings import RISK
 class CriticDayAgent(BaseAgent):
     name = "CriticDayAgent"
     system_prompt = get_prompt("critic_daytrade")
+    model = "claude-opus-4-8"
 
     def review(
         self,

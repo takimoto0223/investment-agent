@@ -11,6 +11,7 @@ from prompts.loader import get_prompt
 class CriticIntelligenceAgent(BaseAgent):
     name = "CriticIntelligenceAgent"
     system_prompt = get_prompt("critic_intelligence")
+    model = "claude-opus-4-8"
 
     def review(
         self,

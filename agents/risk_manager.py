@@ -13,6 +13,7 @@ from config.settings import RISK
 class RiskManagerAgent(BaseAgent):
     name = "RiskManagerAgent"
     system_prompt = get_prompt("risk_manager")
+    model = "claude-opus-4-8"
 
     @staticmethod
     def is_large_order(order_amount_jpy: float, portfolio_total_jpy: float) -> bool:

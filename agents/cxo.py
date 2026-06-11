@@ -18,6 +18,7 @@ from report.template import (
     EveningReportData, MorningReportData,
     HoldingItem, MarginPosition, SectorScore,
     DaytradeCandidate, DiscussionItem,
+    DaytradeRecord, ValueDecision,
     build_evening_html, build_morning_html,
 )
 from report.mailer import send_report
@@ -47,6 +48,7 @@ def _normalize_fx_signal(raw: str) -> str:
 class CXOAgent(BaseAgent):
     name = "CXOAgent"
     system_prompt = CXO_PROMPT
+    model = "claude-opus-4-8"
 
     # ── データ収集 ───────────────────────────────────────────────
 
@@ -154,6 +156,18 @@ class CXOAgent(BaseAgent):
         fx_label = _normalize_fx_signal(fx_dict.get("fx_signal", "hold"))
 
         # 米国株ポジション → HoldingItem
+        _DUMMY_JP = [
+            HoldingItem(symbol="9984", name="ソフトバンクG", value_jpy=320_000, pf_pct=0.0, change_pct=+1.8),
+            HoldingItem(symbol="6857", name="アドバンテスト", value_jpy=250_000, pf_pct=0.0, change_pct=-0.5),
+            HoldingItem(symbol="4063", name="信越化学", value_jpy=180_000, pf_pct=0.0, change_pct=+0.3),
+            HoldingItem(symbol="2330", name="フィックスターズ", value_jpy=90_000, pf_pct=0.0, change_pct=+2.1),
+        ]
+        _DUMMY_US = [
+            HoldingItem(symbol="NVDA", name="NVIDIA", value_jpy=0, pf_pct=0.0, change_pct=+3.2),
+            HoldingItem(symbol="MSFT", name="Microsoft", value_jpy=0, pf_pct=0.0, change_pct=+0.7),
+            HoldingItem(symbol="AAPL", name="Apple", value_jpy=0, pf_pct=0.0, change_pct=-0.4),
+        ]
+
         us_holdings: list[HoldingItem] = []
         for pos in raw["us_positions"]:
             try:
@@ -172,15 +186,29 @@ class CXOAgent(BaseAgent):
             except Exception:
                 continue
 
+        # ブローカー未接続時はダミーデータで円グラフを描画
+        jp_holdings: list[HoldingItem] = _DUMMY_JP
+        if not us_holdings:
+            for d in _DUMMY_US:
+                d.value_jpy = d.value_jpy or (200_000 * usdjpy / 155.0)
+            us_holdings = [
+                HoldingItem(symbol="NVDA", name="NVIDIA", value_jpy=580_000, pf_pct=0.0, change_pct=+3.2),
+                HoldingItem(symbol="MSFT", name="Microsoft", value_jpy=430_000, pf_pct=0.0, change_pct=+0.7),
+                HoldingItem(symbol="AAPL", name="Apple", value_jpy=310_000, pf_pct=0.0, change_pct=-0.4),
+            ]
+
         # 総資産・PF比計算
         usd_equity_jpy = raw["us_equity_usd"] * usdjpy
         jp_cash        = raw["jp_cash_jpy"]
         usd_cash_jpy   = raw["usd_cash"] * usdjpy
         total_jpy      = usd_equity_jpy + jp_cash
         if total_jpy <= 0:
-            total_jpy = max(sum(h.value_jpy for h in us_holdings), 1.0)
+            total_jpy = max(
+                sum(h.value_jpy for h in us_holdings) + sum(h.value_jpy for h in jp_holdings),
+                1.0,
+            )
 
-        for h in us_holdings:
+        for h in us_holdings + jp_holdings:
             h.pf_pct = h.value_jpy / total_jpy if total_jpy > 0 else 0.0
 
         # 円ドル割合
@@ -196,6 +224,7 @@ class CXOAgent(BaseAgent):
 
         return {
             "total_jpy":        total_jpy,
+            "jp_holdings":      jp_holdings,
             "us_holdings":      us_holdings,
             "sector_scores":    sector_scores,
             "fx_label":         fx_label,
@@ -226,7 +255,7 @@ class CXOAgent(BaseAgent):
             generated_at=now,
             total_assets_jpy=d["total_jpy"],
             total_assets_change_pct=0.0,
-            jp_holdings=[],
+            jp_holdings=d["jp_holdings"],
             us_holdings=d["us_holdings"],
             risk_score=d["risk_score"],
             risk_level=ctx.risk_level,
@@ -266,18 +295,76 @@ class CXOAgent(BaseAgent):
         d   = self._build_report_data(raw)
         ctx: MarketContext = d["ctx"]
 
-        # 米国株確定損益（Alpaca account equity から簡易計算）
+        # 米国株デイトレ損益（約定履歴から手数料込みで計算）
         us_realized_pl_usd = 0.0
         us_trade_count     = 0
+        daytrade_records: list[DaytradeRecord] = []
+        daytrade_gross_pl = daytrade_fees = daytrade_net_pl = 0.0
         try:
-            from brokers.alpaca import AlpacaBroker
-            acct = AlpacaBroker().get_account()
-            # last_equity が前日終値ベース（利用可能な場合）
-            last_eq = float(acct.get("last_equity", acct.get("equity", 0)))
-            curr_eq = float(acct.get("equity", 0))
-            us_realized_pl_usd = curr_eq - last_eq
+            from brokers.alpaca import AlpacaBroker, calc_daytrade_pl
+            alpaca = AlpacaBroker()
+            activities = alpaca.get_activities(since_hours=24)
+            pl_result  = calc_daytrade_pl(activities)
+            daytrade_gross_pl = pl_result["total_gross"]
+            daytrade_fees     = pl_result["total_fees"]
+            daytrade_net_pl   = pl_result["total_net"]
+            us_trade_count    = len(pl_result["trades"])
+            us_realized_pl_usd = daytrade_net_pl
+            for t in pl_result["trades"]:
+                daytrade_records.append(DaytradeRecord(
+                    symbol=t["symbol"],
+                    side="sell",
+                    qty=t["qty"],
+                    buy_price=t["buy_price"],
+                    sell_price=t["sell_price"],
+                    gross_pl=t["gross_pl"],
+                    fees=t["fees"],
+                    net_pl=t["net_pl"],
+                ))
+            logger.info(
+                f"デイトレ損益: gross={daytrade_gross_pl:+.2f} "
+                f"fees=-{daytrade_fees:.4f} net={daytrade_net_pl:+.2f} USD"
+            )
         except Exception as exc:
-            logger.warning(f"Alpaca確定損益取得失敗: {exc}")
+            logger.warning(f"デイトレ損益計算失敗: {exc}")
+
+        # バリュー投資 昨日の買い/見送り決定
+        value_decisions: list[ValueDecision] = []
+        try:
+            val_log = Path("logs/us_value_log.json")
+            if val_log.exists():
+                sessions = json.loads(val_log.read_text(encoding="utf-8"))
+                if sessions:
+                    latest_val = sessions[-1]
+                    for ex in latest_val.get("executed", []):
+                        value_decisions.append(ValueDecision(
+                            symbol=ex.get("symbol", ""),
+                            name=ex.get("name", ex.get("symbol", "")),
+                            action="buy",
+                            rationale=ex.get("rationale", ""),
+                            qty=float(ex.get("qty", 0)),
+                            consensus=ex.get("consensus", "execute"),
+                        ))
+                    for rj in latest_val.get("rejected", []):
+                        value_decisions.append(ValueDecision(
+                            symbol=rj.get("symbol", ""),
+                            name=rj.get("symbol", ""),
+                            action="reject",
+                            rationale=rj.get("reason", ""),
+                        ))
+        except Exception as exc:
+            logger.warning(f"バリューログ読み込み失敗: {exc}")
+
+        # 前日デイトレログからus_trade_countをフォールバック補完
+        if us_trade_count == 0:
+            try:
+                dt_log = Path("logs/us_daytrade_log.json")
+                if dt_log.exists():
+                    sessions = json.loads(dt_log.read_text(encoding="utf-8"))
+                    if sessions:
+                        us_trade_count = len(sessions[-1].get("executed", []))
+            except Exception as exc:
+                logger.warning(f"デイトレログ読み込み失敗: {exc}")
 
         # 日本株デイトレ候補
         daytrade_candidates: list[DaytradeCandidate] = []
@@ -324,7 +411,7 @@ class CXOAgent(BaseAgent):
             generated_at=now,
             total_assets_jpy=d["total_jpy"],
             total_assets_change_pct=0.0,
-            jp_holdings=[],
+            jp_holdings=d["jp_holdings"],
             us_holdings=d["us_holdings"],
             risk_score=d["risk_score"],
             risk_level=ctx.risk_level,
@@ -353,10 +440,16 @@ class CXOAgent(BaseAgent):
             overnight_fx_change_pct=0.0,
             discussion_items=discussion_items,
             discussion_session_date=discussion_session_date,
+            daytrade_records=daytrade_records,
+            daytrade_gross_pl=daytrade_gross_pl,
+            daytrade_fees=daytrade_fees,
+            daytrade_net_pl=daytrade_net_pl,
+            value_decisions=value_decisions,
         )
 
         html    = build_morning_html(report_data)
         subject = f"[投資レポート] 朝次サマリー {now.strftime('%Y/%m/%d %H:%M')}"
         ok      = send_report(subject, html)
         logger.info(f"朝レポート送信: {'成功' if ok else '失敗'}")
+        logger.info("=== 日次サイクル完了。次回起動は 21:00（夜間レポート）まで待機 ===")
         return ok

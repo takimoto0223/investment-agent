@@ -12,6 +12,7 @@ from config.settings import RISK
 class CriticEquityAgent(BaseAgent):
     name = "CriticEquityAgent"
     system_prompt = get_prompt("critic_equity")
+    model = "claude-opus-4-8"
 
     def review(
         self,
