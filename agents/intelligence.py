@@ -26,10 +26,15 @@ _SECTOR_KEYWORDS: dict[str, list[str]] = {
     "バイオ×AI":            ["drug discovery", "protein structure", "genomics", "biotech ai", "clinical trial ai"],
 }
 
-# GitHub 検索キーワード
-_GITHUB_KEYWORDS = [
-    "quantum", "mram", "photonic", "neuromorphic",
-    "space", "llm-infra", "chip-design",
+# GitHub 検索クエリ（キーワード + stars:>50 で質を担保）
+_GITHUB_QUERIES = [
+    "llm inference accelerator stars:>50",
+    "gpu memory bandwidth hbm stars:>30",
+    "quantum computing hardware stars:>30",
+    "silicon photonics chip stars:>20",
+    "ai semiconductor chip design stars:>50",
+    "data center cooling ai stars:>30",
+    "small modular reactor smr stars:>20",
 ]
 
 # arxiv カテゴリクエリ
@@ -105,12 +110,13 @@ class IntelligenceAgent(BaseAgent):
         return results
 
     def fetch_github(self) -> list[dict]:
-        """GitHub 検索 API から直近 7 日に作成された高スター数リポジトリを取得する。"""
-        since = (date.today() - timedelta(days=7)).isoformat()
+        """GitHub 検索 API から直近 14 日に更新された高スターリポジトリを取得する。"""
+        since = (date.today() - timedelta(days=14)).isoformat()
         results: list[dict] = []
+        seen: set[str] = set()
 
-        for keyword in _GITHUB_KEYWORDS:
-            q = urllib.parse.quote(f"{keyword} created:>{since}")
+        for query in _GITHUB_QUERIES:
+            q = urllib.parse.quote(f"{query} pushed:>{since}")
             url = (
                 "https://api.github.com/search/repositories"
                 f"?q={q}&sort=stars&order=desc&per_page=3"
@@ -122,9 +128,12 @@ class IntelligenceAgent(BaseAgent):
                 data = json.loads(raw)
                 for item in (data.get("items") or []):
                     name  = item.get("full_name", "")
+                    if name in seen:
+                        continue
+                    seen.add(name)
                     desc  = item.get("description") or ""
                     stars = item.get("stargazers_count", 0)
-                    sectors = _detect_sectors(f"{name} {desc} {keyword}")
+                    sectors = _detect_sectors(f"{name} {desc} {query}")
                     results.append({
                         "source":      "github",
                         "title":       f"{name}（★{stars:,}）",
