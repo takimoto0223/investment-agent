@@ -4,9 +4,15 @@ report/template.py
 メールクライアントで正しく表示されるようインラインCSSで記述。
 SVGによる円グラフ・テーブルベースのレイアウトを使用（CSS Grid/Flex不使用）。
 """
+import base64
+import io
 import math
 from dataclasses import dataclass, field
 from datetime import datetime
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
 # ── カラーパレット ──────────────────────────────────────────────
@@ -72,6 +78,30 @@ class DiscussionItem:
 
 
 @dataclass
+class DaytradeRecord:
+    """デイトレ1件の損益。"""
+    symbol: str
+    side: str               # "buy" | "sell"
+    qty: float
+    buy_price: float
+    sell_price: float
+    gross_pl: float         # グロス損益 (USD)
+    fees: float             # 手数料合計 (USD)
+    net_pl: float           # ネット損益 (USD)
+
+
+@dataclass
+class ValueDecision:
+    """バリュー投資の買い/見送り決定1件。"""
+    symbol: str
+    name: str
+    action: str             # "buy" | "reject"
+    rationale: str          # 買った理由 or 見送り理由
+    qty: float = 0.0
+    consensus: str = ""     # パネル議論の結論
+
+
+@dataclass
 class EveningReportData:
     """夜間（21:00）レポート用データ。"""
     generated_at: datetime
@@ -111,64 +141,48 @@ class MorningReportData(EveningReportData):
     overnight_fx_change_pct: float = 0.0
     discussion_items: list = field(default_factory=list)     # list[DiscussionItem]
     discussion_session_date: str = ""
+    # デイトレ損益詳細
+    daytrade_records: list = field(default_factory=list)     # list[DaytradeRecord]
+    daytrade_gross_pl: float = 0.0      # グロス損益 (USD)
+    daytrade_fees: float = 0.0          # 手数料合計 (USD)
+    daytrade_net_pl: float = 0.0        # ネット損益 (USD)
+    # バリュー投資決定
+    value_decisions: list = field(default_factory=list)      # list[ValueDecision]
 
 
-# ── SVGドーナツチャート ─────────────────────────────────────────
+# ── ドーナツチャート（PNG base64、メールクライアント互換）──────────
 
-def _donut_svg(items: list, size: int = 140) -> str:
+def _donut_img(items: list, size: int = 140) -> str:
     """
-    ドーナツ型円グラフをSVGで生成する。
+    ドーナツ型円グラフをmatplotlibでPNG生成し、base64 <img>タグで返す。
     items: [(label, value, color), ...]
     """
     valid = [(l, v, c) for l, v, c in items if v > 0]
-    cx = cy = size / 2
-    r  = size * 0.42
-    ri = r * 0.55
+    px = size / 100
 
     if not valid:
-        return (
-            f'<svg width="{size}" height="{size}" viewBox="0 0 {size} {size}">'
-            f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" fill="#e5e7eb"/>'
-            f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{ri:.1f}" fill="white"/>'
-            f'<text x="{cx:.1f}" y="{cy + 4:.1f}" text-anchor="middle" '
-            f'fill="#9ca3af" font-size="11" font-family="Arial">なし</text>'
-            f'</svg>'
-        )
+        fig, ax = plt.subplots(figsize=(px, px))
+        ax.pie([1], colors=["#e5e7eb"], wedgeprops={"width": 0.5})
+        ax.text(0, 0, "なし", ha="center", va="center", fontsize=9, color="#9ca3af")
+        ax.axis("equal")
+        fig.patch.set_alpha(0)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", transparent=True, dpi=120)
+        plt.close(fig)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        return f'<img src="data:image/png;base64,{b64}" width="{size}" height="{size}" style="display:block;margin:0 auto;">'
 
-    if len(valid) == 1:
-        _, _, color = valid[0]
-        return (
-            f'<svg width="{size}" height="{size}" viewBox="0 0 {size} {size}">'
-            f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" fill="{color}"/>'
-            f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{ri:.1f}" fill="white"/>'
-            f'</svg>'
-        )
-
-    total  = sum(v for _, v, _ in valid)
-    angle  = -math.pi / 2  # 12時から開始
-    paths  = []
-    for _, value, color in valid:
-        sweep = value / total * 2 * math.pi
-        end   = angle + sweep
-        large = 1 if sweep > math.pi else 0
-        x1  = cx + r  * math.cos(angle);  y1  = cy + r  * math.sin(angle)
-        x2  = cx + r  * math.cos(end);    y2  = cy + r  * math.sin(end)
-        xi1 = cx + ri * math.cos(end);    yi1 = cy + ri * math.sin(end)
-        xi2 = cx + ri * math.cos(angle);  yi2 = cy + ri * math.sin(angle)
-        d = (
-            f"M {x1:.1f} {y1:.1f} "
-            f"A {r:.1f} {r:.1f} 0 {large} 1 {x2:.1f} {y2:.1f} "
-            f"L {xi1:.1f} {yi1:.1f} "
-            f"A {ri:.1f} {ri:.1f} 0 {large} 0 {xi2:.1f} {yi2:.1f} Z"
-        )
-        paths.append(f'<path d="{d}" fill="{color}" stroke="white" stroke-width="1.5"/>')
-        angle = end
-
-    return (
-        f'<svg width="{size}" height="{size}" viewBox="0 0 {size} {size}">'
-        + "".join(paths)
-        + "</svg>"
-    )
+    values = [v for _, v, _ in valid]
+    colors = [c for _, _, c in valid]
+    fig, ax = plt.subplots(figsize=(px, px))
+    ax.pie(values, colors=colors, wedgeprops={"width": 0.5}, startangle=90)
+    ax.axis("equal")
+    fig.patch.set_alpha(0)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", transparent=True, dpi=120)
+    plt.close(fig)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return f'<img src="data:image/png;base64,{b64}" width="{size}" height="{size}" style="display:block;margin:0 auto;">'
 
 
 def _donut_legend(items: list) -> str:
@@ -584,13 +598,13 @@ def _build_base_rows(data: EveningReportData) -> list:
         f'<td width="50%" style="padding-right:12px;vertical-align:top;text-align:center;">'
         f'<div style="font-size:12px;font-weight:bold;color:#374151;margin-bottom:8px;">'
         f'日本株</div>'
-        f'{_donut_svg(jp_items)}'
+        f'{_donut_img(jp_items)}'
         f'<div style="margin-top:8px;text-align:left;">{jp_leg}</div>'
         f'</td>'
         f'<td width="50%" style="padding-left:12px;vertical-align:top;text-align:center;">'
         f'<div style="font-size:12px;font-weight:bold;color:#374151;margin-bottom:8px;">'
         f'米国株</div>'
-        f'{_donut_svg(us_items)}'
+        f'{_donut_img(us_items)}'
         f'<div style="margin-top:8px;text-align:left;">{us_leg}</div>'
         f'</td>'
         f'</tr></table>'
@@ -665,19 +679,48 @@ def _build_base_rows(data: EveningReportData) -> list:
 def _build_morning_rows(data: MorningReportData) -> list:
     rows = []
 
-    # 米国株 昨夜の確定損益
-    pl_c = "#16a34a" if data.us_realized_pl_usd >= 0 else "#dc2626"
-    pl_s = "+" if data.us_realized_pl_usd >= 0 else ""
-    rows.append(_card("米国株 昨夜の確定損益", (
-        f'<table cellpadding="0" cellspacing="0"><tr>'
-        f'<td style="padding-right:20px;vertical-align:top;">'
-        f'<div style="font-size:24px;font-weight:bold;color:{pl_c};">'
-        f'{pl_s}${data.us_realized_pl_usd:,.2f}</div>'
-        f'<div style="font-size:13px;color:{pl_c};">'
-        f'{pl_s}¥{data.us_realized_pl_jpy:,.0f}</div>'
+    # 米国株デイトレ損益（手数料込み詳細）
+    net_c  = "#16a34a" if data.daytrade_net_pl >= 0 else "#dc2626"
+    net_s  = "+" if data.daytrade_net_pl >= 0 else ""
+    gross_c = "#16a34a" if data.daytrade_gross_pl >= 0 else "#dc2626"
+    gross_s = "+" if data.daytrade_gross_pl >= 0 else ""
+
+    # 手数料注記（Alpacaは売り時のみSEC fee + FINRA TAF、買い手数料$0）
+    fee_note = (
+        f'SEC fee ${data.daytrade_fees * 0.9:.4f} + '
+        f'FINRA TAF ${data.daytrade_fees * 0.1:.4f}'
+        if data.daytrade_fees > 0 else "手数料なし"
+    )
+    dt_rows_html = ""
+    for t in data.daytrade_records:
+        t_c = "#16a34a" if t["net_pl"] >= 0 else "#dc2626"
+        t_s = "+" if t["net_pl"] >= 0 else ""
+        dt_rows_html += (
+            f'<tr style="border-bottom:1px solid #f3f4f6;">'
+            f'<td style="padding:4px 8px 4px 0;font-size:12px;font-weight:bold;">{t["symbol"]}</td>'
+            f'<td style="padding:4px 8px;font-size:11px;color:#6b7280;">'
+            f'買 ${t["buy_price"]:.2f} → 売 ${t["sell_price"]:.2f} × {t["qty"]:.0f}株</td>'
+            f'<td style="padding:4px 0;font-size:12px;color:{t_c};text-align:right;">'
+            f'{t_s}${t["net_pl"]:.2f}</td>'
+            f'</tr>'
+        )
+    if not dt_rows_html:
+        dt_rows_html = '<tr><td colspan="3" style="padding:6px 0;font-size:12px;color:#9ca3af;">約定履歴なし</td></tr>'
+
+    rows.append(_card("米国株デイトレ 昨夜の損益", (
+        f'<table cellpadding="0" cellspacing="0" width="100%"><tr>'
+        f'<td style="vertical-align:top;padding-right:20px;">'
+        f'<div style="font-size:22px;font-weight:bold;color:{net_c};">'
+        f'{net_s}${data.daytrade_net_pl:,.2f} <span style="font-size:13px;">（手数料後）</span></div>'
+        f'<div style="font-size:12px;color:{gross_c};margin-top:2px;">'
+        f'グロス {gross_s}${data.daytrade_gross_pl:,.2f}'
+        f' ／ 手数料 -${data.daytrade_fees:.4f}</div>'
+        f'<div style="font-size:10px;color:#9ca3af;margin-top:2px;">{fee_note}</div>'
+        f'<div style="font-size:11px;color:#6b7280;margin-top:4px;">'
+        f'Alpaca手数料: 買い$0 / 売りはSEC fee＋FINRA TАF のみ</div>'
         f'</td>'
-        f'<td style="vertical-align:bottom;">'
-        f'<div style="font-size:12px;color:#9ca3af;">{data.us_trade_count} トレード</div>'
+        f'<td style="vertical-align:top;width:55%;">'
+        f'<table cellpadding="0" cellspacing="0" width="100%">{dt_rows_html}</table>'
         f'</td></tr></table>'
     )))
 
@@ -704,6 +747,30 @@ def _build_morning_rows(data: MorningReportData) -> list:
         f'<div style="font-size:12px;color:#6b7280;margin-top:6px;">'
         f'{data.overnight_fx_summary}</div>'
     )))
+
+    # バリュー投資 昨日の決定サマリー
+    if data.value_decisions:
+        val_rows_html = ""
+        for v in data.value_decisions:
+            if v.action == "buy":
+                badge_c, badge_t = "#16a34a", "買付"
+            else:
+                badge_c, badge_t = "#6b7280", "見送"
+            qty_txt = f" × {v.qty:.0f}株" if v.qty > 0 else ""
+            val_rows_html += (
+                f'<tr style="border-bottom:1px solid #f3f4f6;">'
+                f'<td style="padding:5px 8px 5px 0;vertical-align:top;white-space:nowrap;">'
+                f'<span style="background:{badge_c};color:white;font-size:10px;'
+                f'padding:1px 5px;border-radius:3px;">{badge_t}</span></td>'
+                f'<td style="padding:5px 8px;vertical-align:top;font-size:12px;font-weight:bold;">'
+                f'{v.name or v.symbol}{qty_txt}</td>'
+                f'<td style="padding:5px 0;vertical-align:top;font-size:11px;color:#6b7280;">'
+                f'{v.rationale}</td>'
+                f'</tr>'
+            )
+        rows.append(_card("バリュー投資 昨日の売買判断", (
+            f'<table cellpadding="0" cellspacing="0" width="100%">{val_rows_html}</table>'
+        )))
 
     # インテリジェンスエージェントの議論サマリー
     rows.append(_card(

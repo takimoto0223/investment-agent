@@ -26,9 +26,9 @@ def send_report(subject: str, html_body: str) -> bool:
     HTMLメールをGmail SMTP_SSL (port 465) で送信する。
     送信成功で True、設定未完了または送信失敗で False を返す。
     """
-    from_email   = os.getenv("REPORT_FROM_EMAIL", "")
-    to_email     = os.getenv("REPORT_TO_EMAIL", "")
-    app_password = os.getenv("GMAIL_APP_PASSWORD", "")
+    from_email   = os.getenv("REPORT_FROM_EMAIL", "").strip()
+    to_email     = os.getenv("REPORT_TO_EMAIL", "").strip()
+    app_password = os.getenv("GMAIL_APP_PASSWORD", "").strip()
 
     if not all([from_email, to_email, app_password]):
         logger.warning(

@@ -159,3 +159,103 @@ class AlpacaBroker:
             return OrderResult(success=True, order_id=str(resp.id), message="全決済成功", raw=resp)
         except Exception as e:
             return OrderResult(success=False, order_id=None, message=str(e))
+
+    def get_activities(self, since_hours: int = 24) -> list[dict]:
+        """
+        直近 since_hours 時間の約定履歴（FILL）を返す。
+        各要素: symbol, side, qty, price, transaction_time
+        """
+        from datetime import datetime, timedelta, timezone
+        from alpaca.trading.requests import GetActivitiesRequest
+        try:
+            after = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+            activities = self.client.get_activities(
+                GetActivitiesRequest(activity_types=["FILL"], after=after)
+            )
+            result = []
+            for a in activities:
+                result.append({
+                    "symbol":           a.symbol,
+                    "side":             str(a.side).lower().replace("orderside.", ""),
+                    "qty":              float(a.qty),
+                    "price":            float(a.price),
+                    "transaction_time": a.transaction_time.isoformat() if a.transaction_time else "",
+                    "order_id":         str(a.order_id) if a.order_id else "",
+                })
+            return result
+        except Exception as e:
+            logger.warning(f"get_activities失敗: {e}")
+            return []
+
+
+# ── 手数料計算ユーティリティ ─────────────────────────────────────
+
+_SEC_FEE_RATE  = 0.0000278   # 売り約定代金に対して (SEC Regulatory Fee)
+_FINRA_TAF_RATE = 0.000166   # 売り株数に対して (FINRA TAF)
+_FINRA_TAF_MAX  = 8.30       # 1注文あたり上限
+
+
+def calculate_us_fees(side: str, qty: float, price: float) -> float:
+    """
+    Alpaca の米国株取引手数料を計算する。
+    - 委託手数料: $0（Alpaca は無料）
+    - SEC fee    : 売りのみ。約定代金 × 0.0000278
+    - FINRA TAF  : 売りのみ。株数 × $0.000166（上限 $8.30）
+    戻り値: 手数料合計（USD）
+    """
+    if side != "sell":
+        return 0.0
+    proceeds  = qty * price
+    sec_fee   = proceeds * _SEC_FEE_RATE
+    finra_taf = min(qty * _FINRA_TAF_RATE, _FINRA_TAF_MAX)
+    return round(sec_fee + finra_taf, 4)
+
+
+def calc_daytrade_pl(activities: list[dict]) -> dict:
+    """
+    約定履歴からデイトレ損益を計算する。
+    同一銘柄の buy → sell ペアをマッチングして実現損益を算出。
+    戻り値:
+      trades: [{symbol, buy_price, sell_price, qty, gross_pl, fees, net_pl}]
+      total_gross: 合計グロス損益
+      total_fees : 合計手数料
+      total_net  : 合計ネット損益
+    """
+    from collections import defaultdict
+    buys: dict[str, list] = defaultdict(list)
+    sells: dict[str, list] = defaultdict(list)
+
+    for a in activities:
+        sym = a["symbol"]
+        if "buy" in a["side"]:
+            buys[sym].append(a)
+        else:
+            sells[sym].append(a)
+
+    trades = []
+    for sym in set(list(buys.keys()) + list(sells.keys())):
+        buy_list  = sorted(buys.get(sym, []),  key=lambda x: x["transaction_time"])
+        sell_list = sorted(sells.get(sym, []), key=lambda x: x["transaction_time"])
+        for b, s in zip(buy_list, sell_list):
+            qty       = min(b["qty"], s["qty"])
+            gross_pl  = (s["price"] - b["price"]) * qty
+            fees      = calculate_us_fees("sell", s["qty"], s["price"])
+            net_pl    = gross_pl - fees
+            trades.append({
+                "symbol":     sym,
+                "buy_price":  b["price"],
+                "sell_price": s["price"],
+                "qty":        qty,
+                "gross_pl":   round(gross_pl, 2),
+                "fees":       round(fees, 4),
+                "net_pl":     round(net_pl, 2),
+            })
+
+    total_gross = sum(t["gross_pl"] for t in trades)
+    total_fees  = sum(t["fees"]     for t in trades)
+    return {
+        "trades":      trades,
+        "total_gross": round(total_gross, 2),
+        "total_fees":  round(total_fees, 4),
+        "total_net":   round(total_gross - total_fees, 2),
+    }
