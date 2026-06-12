@@ -9,6 +9,7 @@ Gmail SMTP経由でHTMLレポートメールを送信する。
 """
 import os
 import smtplib
+import socket
 import logging
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -44,7 +45,9 @@ def send_report(subject: str, html_body: str) -> bool:
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     try:
-        with smtplib.SMTP_SSL(_SMTP_HOST, _SMTP_PORT) as smtp:
+        # IPv4を明示的に使用してIPv6非対応環境での失敗を防ぐ
+        ipv4_addr = socket.getaddrinfo(_SMTP_HOST, _SMTP_PORT, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
+        with smtplib.SMTP_SSL(ipv4_addr, _SMTP_PORT) as smtp:
             smtp.login(from_email, app_password)
             smtp.sendmail(from_email, to_email, msg.as_bytes())
         logger.info(f"メール送信成功: {subject!r} → {to_email}")
