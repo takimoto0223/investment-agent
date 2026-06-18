@@ -166,21 +166,24 @@ class AlpacaBroker:
         各要素: symbol, side, qty, price, transaction_time
         """
         from datetime import datetime, timedelta, timezone
-        from alpaca.trading.requests import GetActivitiesRequest
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus, OrderStatus
         try:
             after = datetime.now(timezone.utc) - timedelta(hours=since_hours)
-            activities = self.client.get_activities(
-                GetActivitiesRequest(activity_types=["FILL"], after=after)
+            orders = self.client.get_orders(
+                filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, after=after, limit=200)
             )
             result = []
-            for a in activities:
+            for o in orders:
+                if o.status != OrderStatus.FILLED:
+                    continue
                 result.append({
-                    "symbol":           a.symbol,
-                    "side":             str(a.side).lower().replace("orderside.", ""),
-                    "qty":              float(a.qty),
-                    "price":            float(a.price),
-                    "transaction_time": a.transaction_time.isoformat() if a.transaction_time else "",
-                    "order_id":         str(a.order_id) if a.order_id else "",
+                    "symbol":           o.symbol,
+                    "side":             str(o.side).lower().replace("orderside.", ""),
+                    "qty":              float(o.filled_qty or 0),
+                    "price":            float(o.filled_avg_price or 0),
+                    "transaction_time": o.filled_at.isoformat() if o.filled_at else "",
+                    "order_id":         str(o.id),
                 })
             return result
         except Exception as e:

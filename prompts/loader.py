@@ -6,7 +6,7 @@ prompts/loader.py
 
 使い方:
     from prompts.loader import get_prompt
-    system_prompt = get_prompt("daytrade")
+    system_prompt = get_prompt("scalpday")
 """
 from prompts.all_agents import PROMPTS
 from config.settings import RISK
@@ -28,6 +28,7 @@ def get_prompt(agent_name: str) -> str:
         "{DAYTRADE_STOP_LOSS_PCT}":   str(int(RISK.daytrade_stop_loss_pct * 100)),
         "{USD_JPY_RATE}":             f"{RISK.usd_jpy_rate:.1f}",
         "{MAX_US_POSITION_USD}":      f"{RISK.max_us_position_usd:,}",
+        "{MAX_POSITION_JPY}":         f"{RISK.max_position_jpy:,}",
     }
 
     result = template

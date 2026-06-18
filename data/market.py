@@ -29,8 +29,15 @@ _MOCK_BASE_PRICES: dict[str, float] = {
     "6857": 8500.0,   # アドバンテスト
     "4063": 6200.0,   # 信越化学
     "2330": 1800.0,   # フィックスターズ
-    "7203": 3500.0,   # トヨタ
     "6758": 2800.0,   # ソニーG
+    "7203": 3500.0,   # トヨタ
+    "6954": 4500.0,   # ファナック
+    "8306": 1800.0,   # 三菱UFJ FG
+    "4568": 5500.0,   # 第一三共
+    "9432":  180.0,   # NTT
+    "7974": 8500.0,   # 任天堂
+    "6098": 7000.0,   # リクルートHD
+    "4519": 5000.0,   # 中外製薬
 }
 
 
@@ -211,22 +218,28 @@ def build_universe(base_list: list[dict], exchange: int = 1) -> list[dict]:
             daily = get_daily_bars(sym, exchange)
             today_vol = board.get("TradingVolume", 0)
 
+            current = board.get("CurrentPrice", 0)
+            prev_close = board.get("PreviousClose", current) or current
+            price_change_pct = round((current - prev_close) / prev_close, 4) if prev_close > 0 else 0.0
+
             entry = {
                 **item,
-                "volume_ratio":  calc_volume_ratio(daily, today_vol),
-                "atr_pct":       calc_atr_pct(daily),
-                "current_price": board.get("CurrentPrice", 0),
-                "vwap":          board.get("VWAP", 0),
+                "volume_ratio":    calc_volume_ratio(daily, today_vol),
+                "atr_pct":         calc_atr_pct(daily),
+                "current_price":   current,
+                "vwap":            board.get("VWAP", 0),
+                "price_change_pct": price_change_pct,
             }
             result.append(entry)
             logger.debug(
                 f"ユニバース構築: {sym} "
                 f"volume_ratio={entry['volume_ratio']} "
-                f"atr_pct={entry['atr_pct']}%"
+                f"atr_pct={entry['atr_pct']}% "
+                f"price_change={price_change_pct:+.2%}"
             )
         except Exception as e:
             logger.warning(f"ユニバース構築失敗 {sym}: {e}")
-            result.append({**item, "volume_ratio": 0.0, "atr_pct": 0.0})
+            result.append({**item, "volume_ratio": 0.0, "atr_pct": 0.0, "price_change_pct": 0.0})
     return result
 
 

@@ -18,25 +18,40 @@ _WATCHLIST_PATH = Path(__file__).parent / "watchlist.json"
 
 _DEFAULT_WATCHLIST: dict = {
     "tradeable": [
-        # 発注対象銘柄（スクリーニング対象）
-        {
-            "symbol":     "IONQ",
-            "name":       "IonQ",
-            "market":     "US",
-            "sector":     "量子コンピューター",
-            "max_weight": 0.02,   # PF 最大 2%
-            "added_at":   "2026-06-10",
-            "note":       "量子コンピューター商用化先行。trapped-ion 方式。",
-        },
-        {
-            "symbol":     "QBTS",
-            "name":       "D-Wave Quantum",
-            "market":     "US",
-            "sector":     "量子コンピューター",
-            "max_weight": 0.02,
-            "added_at":   "2026-06-10",
-            "note":       "量子アニーリング方式。最適化問題に特化。",
-        },
+        # ── 日本株 ──────────────────────────────────────────────────────
+        {"symbol": "9984", "name": "ソフトバンクG",  "market": "JP", "sector": "データセンターインフラ", "max_weight": 0.05, "added_at": "2026-06-12"},
+        {"symbol": "6857", "name": "アドバンテスト", "market": "JP", "sector": "AI半導体",             "max_weight": 0.05, "added_at": "2026-06-12"},
+        {"symbol": "4063", "name": "信越化学",        "market": "JP", "sector": "半導体装置・材料",     "max_weight": 0.05, "added_at": "2026-06-12"},
+        {"symbol": "2330", "name": "フィックスターズ","market": "JP", "sector": "宇宙インフラ",         "max_weight": 0.03, "added_at": "2026-06-12"},
+        {"symbol": "6758", "name": "ソニーG",         "market": "JP", "sector": "AI半導体",             "max_weight": 0.05, "added_at": "2026-06-12"},
+        {"symbol": "7203", "name": "トヨタ自動車",    "market": "JP", "sector": "ディフェンシブ",       "max_weight": 0.05, "added_at": "2026-06-12"},
+        {"symbol": "6954", "name": "ファナック",       "market": "JP", "sector": "AI半導体",             "max_weight": 0.03, "added_at": "2026-06-12"},
+        {"symbol": "8306", "name": "三菱UFJ FG",     "market": "JP", "sector": "金融",                 "max_weight": 0.05, "added_at": "2026-06-12"},
+        {"symbol": "4568", "name": "第一三共",         "market": "JP", "sector": "ディフェンシブ",       "max_weight": 0.03, "added_at": "2026-06-12"},
+        {"symbol": "9432", "name": "NTT",             "market": "JP", "sector": "データセンターインフラ","max_weight": 0.05, "added_at": "2026-06-12"},
+        {"symbol": "7974", "name": "任天堂",           "market": "JP", "sector": "ディフェンシブ",       "max_weight": 0.05, "added_at": "2026-06-12"},
+        {"symbol": "6098", "name": "リクルートHD",    "market": "JP", "sector": "データセンターインフラ","max_weight": 0.03, "added_at": "2026-06-12"},
+        {"symbol": "4519", "name": "中外製薬",         "market": "JP", "sector": "ディフェンシブ",       "max_weight": 0.03, "added_at": "2026-06-12"},
+        # ── 米国株 ──────────────────────────────────────────────────────
+        {"symbol": "NVDA",  "name": "NVIDIA",           "market": "US", "sector": "AI半導体",             "max_weight": 0.05, "added_at": "2026-06-12"},
+        {"symbol": "AMD",   "name": "AMD",               "market": "US", "sector": "AI半導体",             "max_weight": 0.03, "added_at": "2026-06-12"},
+        {"symbol": "AVGO",  "name": "Broadcom",          "market": "US", "sector": "AI半導体",             "max_weight": 0.03, "added_at": "2026-06-12"},
+        {"symbol": "MSFT",  "name": "Microsoft",         "market": "US", "sector": "データセンターインフラ","max_weight": 0.05, "added_at": "2026-06-12"},
+        {"symbol": "AAPL",  "name": "Apple",             "market": "US", "sector": "ディフェンシブ",       "max_weight": 0.05, "added_at": "2026-06-12"},
+        {"symbol": "GOOGL", "name": "Alphabet",          "market": "US", "sector": "データセンターインフラ","max_weight": 0.05, "added_at": "2026-06-12"},
+        {"symbol": "META",  "name": "Meta",              "market": "US", "sector": "データセンターインフラ","max_weight": 0.05, "added_at": "2026-06-12"},
+        {"symbol": "AMZN",  "name": "Amazon",            "market": "US", "sector": "データセンターインフラ","max_weight": 0.05, "added_at": "2026-06-12"},
+        {"symbol": "ORCL",  "name": "Oracle",            "market": "US", "sector": "データセンターインフラ","max_weight": 0.03, "added_at": "2026-06-12"},
+        {"symbol": "CRM",   "name": "Salesforce",        "market": "US", "sector": "データセンターインフラ","max_weight": 0.03, "added_at": "2026-06-12"},
+        {"symbol": "TSLA",  "name": "Tesla",             "market": "US", "sector": "AI半導体",             "max_weight": 0.03, "added_at": "2026-06-12"},
+        {"symbol": "JPM",   "name": "JPMorgan Chase",    "market": "US", "sector": "金融",                 "max_weight": 0.05, "added_at": "2026-06-12"},
+        {"symbol": "UNH",   "name": "UnitedHealth",      "market": "US", "sector": "ディフェンシブ",       "max_weight": 0.03, "added_at": "2026-06-12"},
+        {"symbol": "PG",    "name": "Procter & Gamble",  "market": "US", "sector": "ディフェンシブ",       "max_weight": 0.03, "added_at": "2026-06-12"},
+        {"symbol": "KO",    "name": "Coca-Cola",         "market": "US", "sector": "ディフェンシブ",       "max_weight": 0.03, "added_at": "2026-06-12"},
+        {"symbol": "XOM",   "name": "ExxonMobil",        "market": "US", "sector": "エネルギー",           "max_weight": 0.03, "added_at": "2026-06-12"},
+        # ── 量子コンピューター（特殊枠） ─────────────────────────────────
+        {"symbol": "IONQ",  "name": "IonQ",              "market": "US", "sector": "AI半導体",             "max_weight": 0.02, "added_at": "2026-06-10", "note": "量子コンピューター商用化先行。trapped-ion 方式。"},
+        {"symbol": "QBTS",  "name": "D-Wave Quantum",    "market": "US", "sector": "AI半導体",             "max_weight": 0.02, "added_at": "2026-06-10", "note": "量子アニーリング方式。最適化問題に特化。"},
     ],
     "watchonly": [
         # 監視のみ（発注対象外）
@@ -92,6 +107,11 @@ def _save(data: dict) -> None:
 # ──────────────────────────────────────────────
 # 公開 API
 # ──────────────────────────────────────────────
+
+def get_tradeable_by_market(market: str) -> list[dict]:
+    """指定市場（"JP" / "US"）の発注対象銘柄を返す。"""
+    return [i for i in _load()["tradeable"] if i.get("market", "").upper() == market.upper()]
+
 
 def get_tradeable(sector: str | None = None) -> list[dict]:
     """発注対象銘柄を返す。sector を指定するとそのセクターだけ返す。"""

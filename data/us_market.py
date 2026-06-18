@@ -4,6 +4,7 @@ Alpaca API から米国株の市場データを取得するユーティリティ
 日足・5分足・最新気配値を提供し、ユニバース構築を担う。
 """
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 from alpaca.data.historical import StockHistoricalDataClient
@@ -16,6 +17,21 @@ from data.market import calc_atr_pct, calc_volume_ratio
 logger = logging.getLogger(__name__)
 
 _data_client: StockHistoricalDataClient | None = None
+
+# インプロセス TTL キャッシュ（5分）— セッション内の重複API呼び出しを防ぐ
+_CACHE_TTL = 300  # seconds
+_cache: dict[str, tuple[float, object]] = {}  # key → (timestamp, data)
+
+
+def _cache_get(key: str) -> object | None:
+    entry = _cache.get(key)
+    if entry and time.monotonic() - entry[0] < _CACHE_TTL:
+        return entry[1]
+    return None
+
+
+def _cache_set(key: str, data: object) -> None:
+    _cache[key] = (time.monotonic(), data)
 
 
 def _get_client() -> StockHistoricalDataClient:
@@ -37,6 +53,12 @@ def get_daily_bars_us(symbol: str, limit: int = 22) -> list[dict]:
     米国株の日足データを取得する。
     返り値のキー: date, open, high, low, close, volume
     """
+    key = f"daily:{symbol}:{limit}"
+    cached = _cache_get(key)
+    if cached is not None:
+        logger.debug(f"日足キャッシュヒット: {symbol}")
+        return cached  # type: ignore[return-value]
+
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=TimeFrame.Day,
@@ -45,7 +67,7 @@ def get_daily_bars_us(symbol: str, limit: int = 22) -> list[dict]:
     )
     try:
         bars = _get_client().get_stock_bars(req)
-        return [
+        result = [
             {
                 "date":   b.timestamp.strftime("%Y-%m-%d"),
                 "open":   float(b.open),
@@ -56,6 +78,8 @@ def get_daily_bars_us(symbol: str, limit: int = 22) -> list[dict]:
             }
             for b in bars[symbol]
         ][-limit:]
+        _cache_set(key, result)
+        return result
     except Exception as e:
         logger.warning(f"米国株日足取得失敗 {symbol}: {e}")
         return []
@@ -106,18 +130,26 @@ def get_quote_us(symbol: str) -> dict:
     米国株の最新気配値を取得する。
     kabu STATION の get_board() に相当するインターフェースで返す。
     """
+    key = f"quote:{symbol}"
+    cached = _cache_get(key)
+    if cached is not None:
+        logger.debug(f"気配値キャッシュヒット: {symbol}")
+        return cached  # type: ignore[return-value]
+
     req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
     try:
         quotes = _get_client().get_stock_latest_quote(req)
         q = quotes[symbol]
         mid = (float(q.ask_price) + float(q.bid_price)) / 2
-        return {
+        result = {
             "Symbol":        symbol,
             "CurrentPrice":  round(mid, 4),
             "CalcPrice":     round(mid, 4),
             "AskPrice":      float(q.ask_price),
             "BidPrice":      float(q.bid_price),
         }
+        _cache_set(key, result)
+        return result
     except Exception as e:
         logger.warning(f"米国株気配値取得失敗 {symbol}: {e}")
         return {"Symbol": symbol, "CurrentPrice": 0, "CalcPrice": 0}
@@ -142,20 +174,26 @@ def build_us_universe(base_list: list[dict]) -> list[dict]:
             quote = get_quote_us(sym)
             today_vol = daily[-1]["volume"] if daily else 0
 
+            current = quote.get("CurrentPrice", 0)
+            prev_close = daily[-1]["close"] if len(daily) >= 1 else current
+            price_change_pct = round((current - prev_close) / prev_close, 4) if prev_close > 0 else 0.0
+
             entry = {
                 **item,
-                "volume_ratio":  calc_volume_ratio(daily, today_vol),
-                "atr_pct":       calc_atr_pct(daily),
-                "current_price": quote.get("CurrentPrice", 0),
+                "volume_ratio":     calc_volume_ratio(daily, today_vol),
+                "atr_pct":          calc_atr_pct(daily),
+                "current_price":    current,
+                "price_change_pct": price_change_pct,
             }
             result.append(entry)
             logger.info(
                 f"米国株ユニバース: {sym} "
                 f"${entry['current_price']:.2f} "
                 f"volume_ratio={entry['volume_ratio']} "
-                f"atr_pct={entry['atr_pct']}%"
+                f"atr_pct={entry['atr_pct']}% "
+                f"price_change={price_change_pct:+.2%}"
             )
         except Exception as e:
             logger.warning(f"米国株ユニバース構築失敗 {sym}: {e}")
-            result.append({**item, "volume_ratio": 0.0, "atr_pct": 0.0, "current_price": 0.0})
+            result.append({**item, "volume_ratio": 0.0, "atr_pct": 0.0, "current_price": 0.0, "price_change_pct": 0.0})
     return result

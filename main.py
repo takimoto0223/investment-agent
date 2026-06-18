@@ -4,32 +4,62 @@ main.py
 
 実行フロー（デイトレセッション）：
   1. CIO → MarketContext 生成
-  2. DaytradeAgent → 候補銘柄スクリーニング → TradeProposal 生成
-  3. CriticDayAgent → 審査 (CriticVerdict)
+  2. ScalpDay_JP → 候補銘柄スクリーニング → TradeProposal 生成
+  3. ScalpDay_JP_Critic → 審査・修正往復 → CriticVerdict
   4. 承認済みのみ KabuBroker → 発注
   5. 損切り監視ループ（引けまで継続）
   6. 引け前に全ポジション強制決済
 
 実行コマンド:
-  python main.py --mode daytrade         # 日本株デイトレセッション
-  python main.py --mode paper            # ペーパートレード（発注しない）
-  python main.py --mode us_paper         # 米国株ペーパートレード（Alpaca）
-  python main.py --mode intelligence     # 情報収集・議論セッション（毎日 23:00 想定）
-  python main.py --mode morning_report   # 朝次レポート生成＋メール送信（06:00 想定）
-  python main.py --mode evening_report   # 夜間レポート生成＋メール送信（21:00 想定）
+  python main.py --mode scalpday_jp       # 日本株デイトレセッション
+  python main.py --mode moment_swing_jp   # 日本株スイング投資セッション（09:05 想定）
+  python main.py --mode scalpday_us       # 米国株デイトレペーパートレード（Alpaca）
+  python main.py --mode moment_swing_us   # 米国株スイング投資セッション（23:30 想定）
+  python main.py --mode fx_rebalance      # FXリバランスセッション（JP/US どちらか開場時）
+  python main.py --mode intel_scout       # IntelScout 収集セッション（08:00/17:00 JST 想定）
+  python main.py --mode morning_report    # 朝次レポート生成＋メール送信（06:00 想定）
+  python main.py --mode evening_report    # 夜間レポート生成＋メール送信（21:00 想定）
 """
 import argparse
+import ctypes
+import json
 import logging
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 
 from agents.cio import CIOAgent
-from agents.daytrade import DaytradeAgent
-from agents.critic_day import CriticDayAgent
+from agents.scalp_day import ScalpDay_JP, ScalpDay_US
+from agents.critics import (
+    ScalpDay_JP_Critic,
+    ScalpDay_US_Critic,
+    MomentSwing_US_Critic,
+    MomentSwing_JP_Critic,
+    IntelCritic,
+    FXRebalance_Critic,
+)
 from brokers.kabu import KabuBroker
 from config.settings import RISK
 from data import market as mkt
+from data.intel_store import get_news_summary_for_cio, load_state, save_state, IntelState, write_intel_digest, read_intel_digest
+from data.market_clock import is_jp_open, is_us_open
+from data.universe import build_pod_universe
+
+# ── Windowsスリープ防止 ────────────────────────────
+_ES_CONTINUOUS      = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+
+def _prevent_sleep():
+    """長時間セッション中にWindowsのスリープを防ぐ（S3スリープ対策）。"""
+    ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED)
+    logging.getLogger("main").info("スリープ防止: 有効")
+
+def _allow_sleep():
+    """スリープ防止を解除する（セッション終了時に呼ぶ）。"""
+    ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
+    logging.getLogger("main").info("スリープ防止: 解除")
+
 
 # ── ログ設定 ──────────────────────────────────────
 # Windowsコンソールの文字化け対策
@@ -53,6 +83,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
+# マクロデータ（本番は外部APIから取得予定）
+_MACRO_DATA = "USD/JPY=155.2, VIX=18.5, 米10Y=4.35%"
+
 
 # ──────────────────────────────────────────────────
 # ユーティリティ
@@ -75,14 +108,10 @@ def is_near_close() -> bool:
 # ── 米国株セッション時刻ユーティリティ ─────────────────────────────
 
 def _us_session_end() -> datetime:
-    """
-    当日の米国株セッション終了時刻（JST 06:00）を返す。
-    06:00 を過ぎていたら翌日の 06:00 を返す。
-    """
+    """当日の米国株セッション終了時刻（JST 06:00）を返す。翌日跨ぎに対応。"""
     now = datetime.now()
     end = now.replace(hour=6, minute=0, second=0, microsecond=0)
     if now >= end:
-        from datetime import timedelta
         end += timedelta(days=1)
     return end
 
@@ -100,49 +129,60 @@ def is_us_session_active() -> bool:
 
 
 # ──────────────────────────────────────────────────
-# デイトレセッション
+# ScalpDay_JP（日本株デイトレ）セッション
 # ──────────────────────────────────────────────────
 
-# ベース銘柄リスト（volume_ratio・atr_pct は data/market.py が動的に計算して付加する）
-_BASE_SYMBOLS = [
-    {"symbol": "9984", "name": "ソフトバンクG"},
-    {"symbol": "6857", "name": "アドバンテスト"},
-    {"symbol": "4063", "name": "信越化学"},
-    {"symbol": "2330", "name": "フィックスターズ"},
-]
 
+def run_scalpday_jp_session(paper: bool = True):
+    """ScalpDay_JP セッションのメインループ。"""
+    if not is_jp_open():
+        logger.info("東証 閉場/時間外 → ScalpDay_JP セッションをスキップ")
+        return
 
-def run_daytrade_session(paper: bool = True):
-    """デイトレセッションのメインループ。"""
-    logger.info(f"=== デイトレセッション開始 {'[ペーパー]' if paper else '[本番]'} ===")
+    logger.info(f"=== ScalpDay_JP セッション開始 {'[ペーパー]' if paper else '[本番]'} ===")
 
     cio = CIOAgent()
-    daytrade_agent = DaytradeAgent()
-    critic = CriticDayAgent()
+    scalpday_jp_agent = ScalpDay_JP()
+    critic = ScalpDay_JP_Critic()
     broker = KabuBroker()
 
     # 1. MarketContext 生成
     logger.info("CIO: マーケットコンテキスト生成中...")
+    _news, _obs = get_news_summary_for_cio()
     ctx = cio.generate_market_context(
-        news_summary="（本番では外部ニュースAPIから取得）",
-        macro_data="USD/JPY=155.2, VIX=18.5, 米10Y=4.35%",
+        news_summary=_news,
+        macro_data=_MACRO_DATA,
+        obs_source=_obs,
     )
     logger.info(f"コンテキスト: risk={ctx.risk_level}, rotation={ctx.rotation_signal}")
 
-    # リスクが "high" のときはデイトレ中止
-    if ctx.risk_level == "high":
-        logger.warning("リスク水準 HIGH のためデイトレセッションを中止します")
+    # 2. 配分ゲート（旧 risk_level == "high" チェックを吸収）
+    if not paper:
+        try:
+            _wallet = broker.get_wallet_margin()
+            _total_jpy = float(_wallet.get("MarginAccountWallet", 500000))
+        except Exception:
+            logger.warning("ウォレット取得失敗。ペーパー相当の上限で代替")
+            _wallet = {"MarginAccountWallet": 500000}
+            _total_jpy = 500000
+    else:
+        _wallet = {"MarginAccountWallet": 500000}
+        _total_jpy = 500000
+
+    allocs = cio.allocate_budgets(ctx, total_cash_jpy=_total_jpy, cash_usd=0)
+    if allocs["ScalpDay_JP"].budget_jpy == 0:
+        logger.warning(f"配分ゲート: ScalpDay_JP 枠ゼロ (risk={ctx.risk_level}) → セッション中止")
         return
 
-    # 2. ユニバース構築（volume_ratio・atr_pct を動的に計算）
+    # 3. ユニバース構築（CIO セクターフィルタ + カタリスト例外枠）
     logger.info("ユニバース構築中（板情報・日足データ取得）...")
-    universe = mkt.build_universe(_BASE_SYMBOLS)
-    mock_flag = any(mkt.check_kabu_connection() is False for _ in [None])
+    alloc = allocs["ScalpDay_JP"]
+    universe = build_pod_universe("JP", alloc.active_sectors, alloc.catalyst_slots)
     if not mkt.check_kabu_connection():
         logger.info("モードモック: kabuステーション未接続のためモックデータを使用")
 
     # 3. 候補銘柄スクリーニング
-    candidates = daytrade_agent.screen_candidates(universe, ctx)
+    candidates = scalpday_jp_agent.screen_candidates(universe, ctx)
     logger.info(f"候補銘柄: {candidates}")
     if not candidates:
         logger.info("本日のデイトレ対象なし。終了します")
@@ -158,7 +198,7 @@ def run_daytrade_session(paper: bool = True):
             bars_5min  = mkt.get_bars_5min(symbol)
 
             # 提案生成
-            proposal = daytrade_agent.generate_trade_proposal(
+            proposal = scalpday_jp_agent.generate_trade_proposal(
                 symbol=symbol,
                 symbol_name=next((u["name"] for u in universe if u["symbol"] == symbol), symbol),
                 board_data=board_data,
@@ -169,10 +209,13 @@ def run_daytrade_session(paper: bool = True):
                 continue
 
             # クリティーク審査
-            verdict = critic.review(proposal, ctx, broker.get_wallet_margin() if not paper else {"MarginAccountWallet": 500000})
-            if not verdict.approved:
+            approved_proposal, verdict = critic.refine_and_review(
+                scalpday_jp_agent, proposal, ctx, wallet=_wallet
+            )
+            if approved_proposal is None:
                 logger.info(f"{symbol}: クリティーク否決 - {verdict.suggestion}")
                 continue
+            proposal = approved_proposal
 
             # 発注（ペーパーは発注しない）
             if not paper:
@@ -208,7 +251,7 @@ def run_daytrade_session(paper: bool = True):
                 current_price = board.get("CurrentPrice", 0)
                 pos = open_positions[symbol]
 
-                if daytrade_agent.should_emergency_exit(pos, current_price):
+                if scalpday_jp_agent.should_emergency_exit(pos, current_price):
                     if not paper:
                         # 逆方向で成行決済
                         close_side = "1" if pos["side"] == "buy" else "2"
@@ -225,111 +268,263 @@ def run_daytrade_session(paper: bool = True):
             close_side = "1" if pos["side"] == "buy" else "2"
             broker.send_margin_order(symbol, close_side, pos["qty"], price=0)
 
-    logger.info("=== デイトレセッション終了 ===")
+    logger.info("=== ScalpDay_JP セッション終了 ===")
 
 
 # ──────────────────────────────────────────────────
-# 米国株ペーパートレードセッション
+# MomentSwing_JP（日本株スイング）セッション
 # ──────────────────────────────────────────────────
 
-# デイトレ対象ユニバース（モメンタム・出来高重視）
-_US_BASE_SYMBOLS = [
-    {"symbol": "NVDA",  "name": "エヌビディア"},
-    {"symbol": "AAPL",  "name": "アップル"},
-    {"symbol": "MSFT",  "name": "マイクロソフト"},
-    {"symbol": "TSLA",  "name": "テスラ"},
-    {"symbol": "META",  "name": "メタ"},
-    {"symbol": "AMZN",  "name": "アマゾン"},
-    {"symbol": "GOOGL", "name": "アルファベット"},
-]
 
-# バリュー投資ユニバース（中長期保有候補、セクター分散）
-_US_VALUE_UNIVERSE = [
-    {"symbol": "NVDA",  "name": "NVIDIA",           "sector": "semiconductors"},
-    {"symbol": "MSFT",  "name": "Microsoft",        "sector": "software"},
-    {"symbol": "AAPL",  "name": "Apple",            "sector": "consumer_tech"},
-    {"symbol": "GOOGL", "name": "Alphabet",         "sector": "internet"},
-    {"symbol": "META",  "name": "Meta",             "sector": "internet"},
-    {"symbol": "AMZN",  "name": "Amazon",           "sector": "ecommerce_cloud"},
-    {"symbol": "AMD",   "name": "AMD",              "sector": "semiconductors"},
-    {"symbol": "AVGO",  "name": "Broadcom",         "sector": "semiconductors"},
-    {"symbol": "ORCL",  "name": "Oracle",           "sector": "software"},
-    {"symbol": "CRM",   "name": "Salesforce",       "sector": "software"},
-    {"symbol": "JPM",   "name": "JPMorgan Chase",   "sector": "financials"},
-    {"symbol": "UNH",   "name": "UnitedHealth",     "sector": "healthcare"},
-    {"symbol": "PG",    "name": "Procter & Gamble", "sector": "consumer_staples"},
-    {"symbol": "KO",    "name": "Coca-Cola",        "sector": "consumer_staples"},
-    {"symbol": "XOM",   "name": "ExxonMobil",       "sector": "energy"},
-]
+def _save_moment_swing_jp_log(
+    executed: list[dict],
+    total_jpy: float,
+    risk_level: str,
+    rejected: list[dict] | None = None,
+) -> None:
+    log_path = Path("logs/moment_swing_jp_log.json")
+    log_path.parent.mkdir(exist_ok=True)
+    existing: list[dict] = []
+    if log_path.exists():
+        try:
+            existing = json.loads(log_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    existing.append({
+        "session_date": datetime.now().isoformat(),
+        "risk_level":   risk_level,
+        "total_jpy":    total_jpy,
+        "executed":     executed,
+        "rejected":     rejected or [],
+    })
+    log_path.write_text(
+        json.dumps(existing[-30:], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logger.info(f"MomentSwingJPログ保存: {log_path}")
 
 
-def _refine_and_review(
-    proposer,
-    proposal,
-    critic,
-    ctx,
-    acct: dict,
-    fx_signal: dict,
-    max_rounds: int = 2,
-) -> tuple:
+def run_moment_swing_jp_session(paper: bool = True):
     """
-    提案 → CriticUS審査 → 否決なら提案者に修正依頼 → 再審査 のループ。
-    (最終proposal, 最終verdict) を返す。
-
-    - 市場時間外など fixable=False の否決は即打ち切り
-    - proposer が revise_proposal() を持たない場合もそのまま返す
+    MomentSwing_JP セッション（毎朝 09:05 JST 想定）。
+    MomentSwing_JP でモメンタム候補を選定 → Critic審査 → kabu 発注。
+    ポジション監視は引けまで行い SL/TP 到達時はメール通知（自動決済なし）。
+    結果は logs/moment_swing_jp_log.json に保存する。
     """
-    from agents.base import CriticVerdict
+    if not is_jp_open():
+        logger.info("東証 閉場/時間外 → MomentSwing_JP セッションをスキップ")
+        return
 
-    for round_n in range(1, max_rounds + 1):
-        verdict = critic.review(proposal, ctx, acct, fx_signal)
-        if verdict.approved:
-            if round_n > 1:
-                logger.info(f"[{proposal.symbol}] Round {round_n}: 修正後に承認")
-            return proposal, verdict
-
-        logger.info(
-            f"[{proposal.symbol}] Round {round_n} 否決 — "
-            f"{', '.join(verdict.issues[:2])}"
-        )
-
-        if not verdict.fixable:
-            logger.info(f"[{proposal.symbol}] 修正不能（fixable=False）→ 終了")
-            return proposal, verdict
-
-        if not hasattr(proposer, "revise_proposal"):
-            return proposal, verdict
-
-        revised = proposer.revise_proposal(
-            proposal, verdict.issues, verdict.suggestion, ctx
-        )
-        if revised is None:
-            logger.info(f"[{proposal.symbol}] 提案者が修正断念 → 否決確定")
-            return proposal, verdict
-
-        proposal = revised
-
-    # max_rounds 消化後の最終審査
-    verdict = critic.review(proposal, ctx, acct, fx_signal)
-    return proposal, verdict
-
-
-def run_us_value_session():
-    """
-    米国株バリュー投資セッション（毎日22:00 JST想定）。
-    USEquityAgent で中長期保有候補を選定 → パネル議論 → CriticUS審査 → Alpaca発注。
-    結果は logs/us_value_log.json に保存する。
-    """
-    import json as _json
-    from pathlib import Path
-    from datetime import datetime as _dt
-    from brokers.alpaca import AlpacaBroker
-    from agents.us_equity import USEquityAgent
-    from agents.critic_us import CriticUSAgent
+    from agents.moment_swing import MomentSwing_JP
     from agents.fx_strategy import FXStrategyAgent
-    from config.settings import RISK
 
-    logger.info("=== 米国株バリュー投資セッション開始 ===")
+    logger.info(f"=== MomentSwing_JP セッション開始 {'[ペーパー]' if paper else '[本番]'} ===")
+    _prevent_sleep()
+
+    broker = KabuBroker()
+
+    # ウォレット取得
+    if not paper:
+        try:
+            _wallet = broker.get_wallet_margin()
+            total_jpy = float(_wallet.get("MarginAccountWallet", 500_000))
+        except Exception:
+            logger.warning("ウォレット取得失敗。ペーパー上限で代替")
+            _wallet = {"MarginAccountWallet": 500_000}
+            total_jpy = 500_000
+    else:
+        _wallet = {"MarginAccountWallet": 500_000}
+        total_jpy = 500_000
+
+    # MarketContext（CIOキャッシュがあれば再利用）
+    cio = CIOAgent()
+    _news, _obs = get_news_summary_for_cio()
+    ctx = cio.generate_market_context(
+        news_summary=_news,
+        macro_data=_MACRO_DATA,
+        obs_source=_obs,
+    )
+    logger.info(f"コンテキスト: risk={ctx.risk_level}, rotation={ctx.rotation_signal}")
+
+    # FXシグナル（allocate_budgets の usd_jpy_rate に必要）
+    fx_agent = FXStrategyAgent()
+    fx_signal = fx_agent.generate_signal(_MACRO_DATA, 0.35, ctx)
+    usd_jpy_rate = float(fx_signal.get("usd_jpy_rate", 155.0))
+
+    # CIO 配分ゲート
+    allocs = cio.allocate_budgets(
+        ctx, total_cash_jpy=total_jpy, cash_usd=0, usd_jpy_rate=usd_jpy_rate
+    )
+    if allocs["MomentSwing_JP"].budget_jpy == 0:
+        logger.warning(f"配分ゲート: MomentSwing_JP 枠ゼロ (risk={ctx.risk_level}) → セッション終了")
+        _save_moment_swing_jp_log([], total_jpy, ctx.risk_level)
+        _allow_sleep()
+        return
+
+    budget_jpy = allocs["MomentSwing_JP"].budget_jpy
+    max_pos_jpy = float(getattr(RISK, "max_position_jpy", 500_000))
+    logger.info(f"MomentSwing_JP 配分枠: ¥{budget_jpy:,.0f} / 1銘柄上限 ¥{max_pos_jpy:,.0f}")
+
+    # 既存ポジション
+    try:
+        existing_positions = broker.get_positions() if not paper else []
+    except Exception:
+        existing_positions = []
+    existing_symbols = [str(p.get("symbol", "")) for p in existing_positions]
+
+    # スクリーニング
+    swing_agent = MomentSwing_JP()
+    jp_swing_universe = build_pod_universe(
+        "JP", allocs["MomentSwing_JP"].active_sectors, allocs["MomentSwing_JP"].catalyst_slots
+    )
+    proposals = swing_agent.screen_value(
+        universe=jp_swing_universe,
+        ctx=ctx,
+        existing_symbols=existing_symbols,
+        max_position=max_pos_jpy,
+        cash=budget_jpy,
+    )
+    logger.info(f"MomentSwingJP 候補提案数: {len(proposals)}")
+
+    if not proposals:
+        logger.info("MomentSwingJP 候補なし。セッション終了")
+        _save_moment_swing_jp_log([], total_jpy, ctx.risk_level)
+        _allow_sleep()
+        return
+
+    # 価格補完（Criticが price=0 を即否決するため審査前に取得）
+    for proposal in proposals:
+        try:
+            board = mkt.get_board(proposal.symbol)
+            current_price = float(board.get("CurrentPrice", 0))
+            if current_price > 0:
+                sl_pct = proposal.extra.get("stop_loss_pct", 0.06)
+                tp_pct = proposal.extra.get("target_return_pct", 0.12)
+                proposal.price       = current_price
+                proposal.qty         = int(max_pos_jpy / current_price / 100) * 100
+                proposal.qty         = max(100, proposal.qty)
+                proposal.stop_loss   = round(current_price * (1 - sl_pct), 0)
+                proposal.take_profit = round(current_price * (1 + tp_pct), 0)
+                logger.info(
+                    f"{proposal.symbol}: 価格補完 ¥{current_price:.0f} "
+                    f"SL=¥{proposal.stop_loss:.0f} TP=¥{proposal.take_profit:.0f} qty={proposal.qty}"
+                )
+        except Exception as e:
+            logger.warning(f"{proposal.symbol}: 価格補完失敗 {e}")
+
+    critic = MomentSwing_JP_Critic()
+    executed: list[dict] = []
+    rejected: list[dict] = []
+
+    for proposal in proposals:
+        logger.info(f"審議開始: {proposal.symbol} — {proposal.rationale}")
+        approved_proposal, verdict = critic.refine_and_review(
+            swing_agent, proposal, ctx, wallet=_wallet
+        )
+        if approved_proposal is None:
+            logger.info(f"{proposal.symbol}: Critic否決 — {verdict.suggestion}")
+            rejected.append({"symbol": proposal.symbol, "reason": verdict.suggestion})
+            continue
+        proposal = approved_proposal
+
+        if not paper:
+            result = broker.send_margin_order(
+                symbol=proposal.symbol,
+                side="2",  # 買い
+                qty=proposal.qty,
+                price=proposal.price,
+            )
+            if result.success:
+                logger.info(f"[MomentSwingJP 買い] {proposal.symbol} x{proposal.qty} order_id={result.order_id}")
+                executed.append({
+                    "symbol":            proposal.symbol,
+                    "name":              proposal.extra.get("name", proposal.symbol),
+                    "qty":               proposal.qty,
+                    "price":             proposal.price,
+                    "rationale":         proposal.rationale,
+                    "order_id":          result.order_id,
+                    "stop_loss_pct":     proposal.extra.get("stop_loss_pct", 0.06),
+                    "target_return_pct": proposal.extra.get("target_return_pct", 0.12),
+                })
+            else:
+                logger.warning(f"{proposal.symbol}: 発注失敗 — {result.message}")
+                rejected.append({"symbol": proposal.symbol, "reason": result.message})
+        else:
+            logger.info(f"[ペーパー] MomentSwingJP 発注シミュレート: {proposal.symbol} ¥{proposal.price:.0f} x{proposal.qty}")
+            executed.append({
+                "symbol":            proposal.symbol,
+                "name":              proposal.extra.get("name", proposal.symbol),
+                "qty":               proposal.qty,
+                "price":             proposal.price,
+                "rationale":         proposal.rationale,
+                "order_id":          "paper",
+                "stop_loss_pct":     proposal.extra.get("stop_loss_pct", 0.06),
+                "target_return_pct": proposal.extra.get("target_return_pct", 0.12),
+            })
+
+    _save_moment_swing_jp_log(executed, total_jpy, ctx.risk_level, rejected)
+
+    # SL/TP 監視（引けまで 15 分ごとチェック、自動決済せず CxO 経由で通知）
+    if executed:
+        stop_loss_map   = {e["symbol"]: e["stop_loss_pct"]     for e in executed}
+        take_profit_map = {e["symbol"]: e["target_return_pct"] for e in executed}
+        entry_map       = {e["symbol"]: e["price"]             for e in executed}
+
+        from agents.cxo import CXOAgent
+        cxo = CXOAgent()
+        pending_approval: set[str] = set()
+
+        logger.info(f"MomentSwingJP 監視開始（引けまで）: {list(stop_loss_map.keys())}")
+        while is_trading_hours():
+            time.sleep(900)  # 15分ごとチェック
+            try:
+                for symbol in list(stop_loss_map.keys()):
+                    board = mkt.get_board(symbol) if paper else broker.get_board(symbol)
+                    current = float(board.get("CurrentPrice", 0))
+                    if current <= 0:
+                        continue
+                    entry = entry_map.get(symbol, current)
+                    chg   = (current - entry) / entry if entry > 0 else 0.0
+                    sl    = stop_loss_map[symbol]
+                    tp    = take_profit_map[symbol]
+                    logger.info(f"  {symbol}: {chg:+.2%} (SL:{sl:.0%}/TP:{tp:.0%})")
+                    if symbol not in pending_approval:
+                        if chg <= -sl:
+                            logger.warning(f"MomentSwingJP SL到達: {symbol} {chg:+.2%}")
+                            cxo.notify_action_required(symbol, "stop_loss", chg, sl, current, (current - entry) * executed[0]["qty"])
+                            pending_approval.add(symbol)
+                        elif chg >= tp:
+                            logger.info(f"MomentSwingJP TP到達: {symbol} {chg:+.2%}")
+                            cxo.notify_action_required(symbol, "take_profit", chg, tp, current, (current - entry) * executed[0]["qty"])
+                            pending_approval.add(symbol)
+            except Exception as e:
+                logger.error(f"MomentSwingJP 監視エラー: {e}")
+
+    _allow_sleep()
+    logger.info(f"=== MomentSwing_JP セッション終了: 発注{len(executed)}件 ===")
+
+
+# ──────────────────────────────────────────────────
+# MomentSwing_US（米国株スイング）セッション
+# ──────────────────────────────────────────────────
+
+
+def run_moment_swing_us_session():
+    """
+    MomentSwing_US セッション（毎日 23:30 JST 想定）。
+    MomentSwing_US で中長期保有候補を選定 → Critic審査 → Alpaca発注。
+    結果は logs/moment_swing_us_log.json に保存する。
+    """
+    if not is_us_open():
+        logger.info("NYSE 閉場/時間外 → MomentSwing_US セッションをスキップ")
+        return
+
+    from brokers.alpaca import AlpacaBroker
+    from agents.moment_swing import MomentSwing_US
+    from agents.fx_strategy import FXStrategyAgent
+
+    logger.info("=== MomentSwing_US セッション開始 ===")
+    _prevent_sleep()
 
     broker = AlpacaBroker()
     acct = broker.get_account()
@@ -345,40 +540,53 @@ def run_us_value_session():
 
     # MarketContext
     cio = CIOAgent()
-    macro_data = "USD/JPY=155.2, VIX=18.5, 米10Y=4.35%"
+    _news, _obs = get_news_summary_for_cio()
     ctx = cio.generate_market_context(
-        news_summary="（バリュー投資セッション）",
-        macro_data=macro_data,
+        news_summary=_news,
+        macro_data=_MACRO_DATA,
+        obs_source=_obs,
     )
     logger.info(f"コンテキスト: risk={ctx.risk_level}, rotation={ctx.rotation_signal}")
 
-    # FXシグナル
+    # FXシグナル（配分ゲートで usd_jpy_rate を使うため先に取得）
     fx_agent = FXStrategyAgent()
-    fx_signal = fx_agent.generate_signal(macro_data, 0.35, ctx)
+    fx_signal = fx_agent.generate_signal(_MACRO_DATA, 0.35, ctx)
+    usd_jpy_rate = float(fx_signal.get("usd_jpy_rate", 155.0))
+
+    # 配分ゲート（usd_jpy_rate は FXStrategyAgent 由来）
+    allocs = cio.allocate_budgets(ctx, total_cash_jpy=0, cash_usd=cash_usd, usd_jpy_rate=usd_jpy_rate)
+    if allocs["MomentSwing_US"].budget_usd == 0:
+        logger.warning(f"配分ゲート: MomentSwing_US 枠ゼロ (risk={ctx.risk_level}) → セッション終了")
+        _save_moment_swing_us_log([], cash_usd, ctx.risk_level)
+        _allow_sleep()
+        return
 
     # 既存ポジション
     existing_positions = broker.get_positions()
     existing_symbols = [p.get("symbol", "") for p in existing_positions]
     logger.info(f"既存ポジション: {existing_symbols}")
 
-    # バリュー候補スクリーニング
+    # スイング候補スクリーニング
     max_pos_usd = float(getattr(RISK, "max_us_position_usd", 3000))
-    us_equity = USEquityAgent()
-    proposals = us_equity.screen_value(
-        universe=_US_VALUE_UNIVERSE,
+    moment_swing_us_agent = MomentSwing_US()
+    moment_swing_us_universe = build_pod_universe(
+        "US", allocs["MomentSwing_US"].active_sectors, allocs["MomentSwing_US"].catalyst_slots
+    )
+    proposals = moment_swing_us_agent.screen_value(
+        universe=moment_swing_us_universe,
         ctx=ctx,
         existing_symbols=existing_symbols,
-        max_position_usd=max_pos_usd,
-        cash_usd=cash_usd,
+        max_position=max_pos_usd,
+        cash=cash_usd,
     )
-    logger.info(f"バリュー候補提案数: {len(proposals)}")
+    logger.info(f"MomentSwingUS 候補提案数: {len(proposals)}")
 
     if not proposals:
-        logger.info("バリュー投資候補なし。セッション終了")
-        _save_us_value_log([], cash_usd, ctx.risk_level)
+        logger.info("MomentSwingUS 候補なし。セッション終了")
+        _save_moment_swing_us_log([], cash_usd, ctx.risk_level)
         return
 
-    # ── 価格補完（CriticUSが price=0 を即否決するため、審査前に現在値を取得） ──
+    # ── 価格補完（CriticUS が price=0 を即否決するため、審査前に現在値を取得） ──
     from data import us_market as us_mkt
     for proposal in proposals:
         try:
@@ -398,42 +606,31 @@ def run_us_value_session():
         except Exception as e:
             logger.warning(f"{proposal.symbol}: 価格補完失敗 {e}")
 
-    critic = CriticUSAgent()
+    # ── 準備フェーズ完了。市場オープン（ET 9:30 = JST 22:30）まで待機 ──
+    wait_until("22:30")
+
+    critic = MomentSwing_US_Critic()
     executed: list[dict] = []
     rejected: list[dict] = []
 
     for proposal in proposals:
         logger.info(f"審議開始: {proposal.symbol} — {proposal.rationale}")
 
-        # パネル議論（CIO・FX・リスク視点）
-        risk_notes = f"既存ポジション数: {len(existing_symbols)}, 現金: ${cash_usd:,.0f}"
-        panel = us_equity.panel_review(proposal, ctx, fx_signal, risk_notes)
-        consensus = panel.get("consensus", "defer")
-        logger.info(
-            f"  CIO:{panel['cio_opinion']} FX:{panel['fx_opinion']} "
-            f"Risk:{panel['risk_opinion']} → {consensus}"
+        # CriticUS審査（否決なら moment_swing_us_agent に修正依頼して再審査）
+        approved_proposal, critic_verdict = critic.refine_and_review(
+            moment_swing_us_agent, proposal, ctx, account=acct, fx_signal=fx_signal
         )
-        logger.info(f"  議論結論: {panel.get('consensus_reason', '')}")
-
-        if consensus == "reject":
-            logger.info(f"{proposal.symbol}: パネル議論で否決")
-            rejected.append({"symbol": proposal.symbol, "reason": panel.get("consensus_reason", "")})
-            continue
-
-        # CriticUS最終審査（否決なら us_equity に修正依頼して再審査）
-        proposal, critic_verdict = _refine_and_review(
-            us_equity, proposal, critic, ctx, acct, fx_signal
-        )
-        if not critic_verdict.approved:
+        if approved_proposal is None:
             logger.info(f"{proposal.symbol}: CriticUS最終否決 — {critic_verdict.suggestion}")
             rejected.append({"symbol": proposal.symbol, "reason": critic_verdict.suggestion})
             continue
+        proposal = approved_proposal
 
         # 成行発注
         result = broker.send_market_order(proposal.symbol, proposal.qty, "buy")
         if result.success:
             logger.info(
-                f"[バリュー買い] {proposal.symbol} x{proposal.qty} "
+                f"[MomentSwingUS 買い] {proposal.symbol} x{proposal.qty} "
                 f"order_id={result.order_id}"
             )
             executed.append({
@@ -442,7 +639,6 @@ def run_us_value_session():
                 "qty":        proposal.qty,
                 "rationale":  proposal.rationale,
                 "order_id":   result.order_id,
-                "consensus":  consensus,
                 "stop_loss_pct":       proposal.extra.get("stop_loss_pct", 0.08),
                 "target_return_pct":   proposal.extra.get("target_return_pct", 0.15),
             })
@@ -450,95 +646,227 @@ def run_us_value_session():
             logger.warning(f"{proposal.symbol}: 発注失敗 — {result.message}")
             rejected.append({"symbol": proposal.symbol, "reason": result.message})
 
-    _save_us_value_log(executed, cash_usd, ctx.risk_level, rejected)
+    _save_moment_swing_us_log(executed, cash_usd, ctx.risk_level, rejected)
 
-    # ── バリューポジション監視ループ（6時まで、ポジションは閉じない） ──
+    # ── MomentSwingUS ポジション監視ループ（6時まで、ポジションは閉じない） ──
     if not executed:
-        logger.info("=== 米国株バリュー投資セッション終了（発注なし） ===")
+        logger.info("=== MomentSwing_US セッション終了（発注なし） ===")
         return
 
-    # 銘柄ごとのストップロス率を記録
-    stop_loss_map = {e["symbol"]: e.get("stop_loss_pct", 0.08) for e in executed}
-    session_end   = _us_session_end()
-    logger.info(f"バリューポジション監視開始（{session_end.strftime('%H:%M')}まで）: {list(stop_loss_map.keys())}")
+    # 当日発注分の SL/TP マップ
+    stop_loss_map   = {e["symbol"]: e.get("stop_loss_pct",    0.08) for e in executed}
+    take_profit_map = {e["symbol"]: e.get("target_return_pct", 0.15) for e in executed}
+
+    # 前日以前から保有中のポジションを moment_swing_us_log から復元（翌日監視対応）
+    _log = Path("logs/moment_swing_us_log.json")
+    if _log.exists():
+        try:
+            all_sessions = json.loads(_log.read_text(encoding="utf-8"))
+            historical: dict[str, dict] = {}
+            for sess in all_sessions:
+                for entry in sess.get("executed", []):
+                    historical[entry["symbol"]] = entry
+            held_symbols = {p["symbol"] for p in existing_positions}
+            for sym in held_symbols:
+                if sym not in stop_loss_map and sym in historical:
+                    h = historical[sym]
+                    stop_loss_map[sym]   = h.get("stop_loss_pct",    0.08)
+                    take_profit_map[sym] = h.get("target_return_pct", 0.15)
+                    logger.info(
+                        f"前日ポジション監視追加: {sym} "
+                        f"SL={stop_loss_map[sym]:.0%} TP={take_profit_map[sym]:.0%}"
+                    )
+        except Exception as e:
+            logger.warning(f"MomentSwingUSログ読み込み失敗（前日ポジション復元スキップ）: {e}")
+
+    from agents.cxo import CXOAgent
+    cxo = CXOAgent()
+    pending_approval: set[str] = set()  # 通知済みで承認待ちの銘柄（重複通知防止）
+
+    session_end = _us_session_end()
+    logger.info(f"MomentSwingUS 監視開始（{session_end.strftime('%H:%M')}まで）: {list(stop_loss_map.keys())}")
 
     while datetime.now() < session_end:
         time.sleep(1800)  # 30分ごとチェック
         try:
             positions = broker.get_positions()
             pos_map   = {p["symbol"]: p for p in positions}
-            for symbol, sl_pct in list(stop_loss_map.items()):
+            for symbol in list(stop_loss_map.keys()):
                 pos = pos_map.get(symbol)
                 if not pos:
+                    # ポジションが消えた（ユーザーが手動決済）→ 監視解除
+                    stop_loss_map.pop(symbol, None)
+                    take_profit_map.pop(symbol, None)
+                    pending_approval.discard(symbol)
                     continue
                 entry   = float(pos["avg_entry_price"])
                 current = float(pos["current_price"])
                 chg     = (current - entry) / entry if entry > 0 else 0.0
                 unpl    = float(pos["unrealized_pl"])
-                logger.info(f"  {symbol}: {chg:+.2%} 含み損益 ${unpl:+.2f}")
-                if chg <= -sl_pct:
-                    logger.warning(f"バリューSL発動: {symbol} {chg:+.2%}（設定SL:{sl_pct:.0%}）→ 売却")
-                    broker.close_position(symbol)
-                    del stop_loss_map[symbol]
+                sl_pct  = stop_loss_map[symbol]
+                tp_pct  = take_profit_map.get(symbol, 0.15)
+                logger.info(f"  {symbol}: {chg:+.2%} 含み損益 ${unpl:+.2f} (SL:{sl_pct:.0%}/TP:{tp_pct:.0%})")
+
+                # SL/TP 条件到達 → CxO 経由でメール通知（自動決済しない）
+                if symbol not in pending_approval:
+                    if chg <= -sl_pct:
+                        logger.warning(f"MomentSwingUS SL条件到達: {symbol} {chg:+.2%} — 要承認メール送信")
+                        cxo.notify_action_required(
+                            symbol, "stop_loss", chg, sl_pct, current, unpl
+                        )
+                        pending_approval.add(symbol)
+                    elif chg >= tp_pct:
+                        logger.info(f"MomentSwingUS TP条件到達: {symbol} {chg:+.2%} — 要承認メール送信")
+                        cxo.notify_action_required(
+                            symbol, "take_profit", chg, tp_pct, current, unpl
+                        )
+                        pending_approval.add(symbol)
         except Exception as e:
-            logger.error(f"バリュー監視エラー: {e}")
+            logger.error(f"MomentSwingUS 監視エラー: {e}")
 
-    logger.info(f"=== 米国株バリュー投資セッション終了: 発注{len(executed)}件 ===")
+    _allow_sleep()
+    logger.info(f"=== MomentSwing_US セッション終了: 発注{len(executed)}件 ===")
 
 
-def _save_us_value_log(
+def _save_moment_swing_us_log(
     executed: list[dict],
     cash_usd: float,
     risk_level: str,
     rejected: list[dict] | None = None,
 ) -> None:
-    import json as _json
-    from pathlib import Path
-    from datetime import datetime as _dt
-
-    log_path = Path("logs/us_value_log.json")
+    log_path = Path("logs/moment_swing_us_log.json")
     log_path.parent.mkdir(exist_ok=True)
     existing: list[dict] = []
     if log_path.exists():
         try:
-            existing = _json.loads(log_path.read_text(encoding="utf-8"))
+            existing = json.loads(log_path.read_text(encoding="utf-8"))
         except Exception:
             pass
     existing.append({
-        "session_date": _dt.now().isoformat(),
+        "session_date": datetime.now().isoformat(),
         "risk_level":   risk_level,
         "cash_usd":     cash_usd,
         "executed":     executed,
         "rejected":     rejected or [],
     })
     log_path.write_text(
-        _json.dumps(existing[-30:], ensure_ascii=False, indent=2),
+        json.dumps(existing[-30:], ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    logger.info(f"バリューログ保存: {log_path}")
+    logger.info(f"MomentSwingUSログ保存: {log_path}")
 
 
-def run_us_paper_session():
+def _generate_session_report(
+    executed: list[dict],
+    broker,
+    session_start: "datetime",
+    fx_signal: dict,
+    ctx,
+) -> None:
+    """10分セッション終了後のサマリーレポートを生成・出力する。"""
+    from brokers.alpaca import calc_daytrade_pl
+
+    elapsed_min = (datetime.now() - session_start).total_seconds() / 60
+
+    activities = []
+    try:
+        activities = broker.get_activities(since_hours=1)
+    except Exception as e:
+        logger.warning(f"約定履歴取得失敗: {e}")
+
+    pl = calc_daytrade_pl(activities)
+
+    lines = [
+        "",
+        "══════════════════════════════════════════════",
+        "  ScalpDay_US セッションレポート",
+        f"  開始: {session_start.strftime('%Y-%m-%d %H:%M')} "
+        f"  終了: {datetime.now().strftime('%H:%M')}  ({elapsed_min:.0f}分)",
+        "══════════════════════════════════════════════",
+        f"  リスク水準: {ctx.risk_level}  ローテーション: {ctx.rotation_signal}",
+        f"  FXシグナル: {fx_signal.get('fx_signal', 'N/A')}"
+        f"  US配分バイアス: {fx_signal.get('us_weight_bias', 'N/A')}",
+        f"  発注件数: {len(executed)} 件",
+        "",
+        "── デイトレ損益 ────────────────────────────",
+        f"  グロス損益: ${pl['total_gross']:+.2f}",
+        f"  手数料:     ${pl['total_fees']:.4f}",
+        f"  ネット損益: ${pl['total_net']:+.2f}",
+    ]
+
+    if pl["trades"]:
+        lines += ["", "── トレード詳細 ─────────────────────────────"]
+        for t in pl["trades"]:
+            lines.append(
+                f"  {t['symbol']}: 買${t['buy_price']:.2f} → 売${t['sell_price']:.2f}"
+                f"  x{t['qty']}株  純損益 ${t['net_pl']:+.2f}"
+            )
+
+    # 未決済残ポジション
+    try:
+        positions = broker.get_positions()
+        if positions:
+            lines += ["", "── 未決済ポジション（決済済みのはず） ─────────"]
+            for p in positions:
+                lines.append(
+                    f"  {p['symbol']}: 含み損益 ${float(p['unrealized_pl']):+.2f}"
+                    f"  現在 ${float(p['current_price']):.2f}"
+                    f"  取得単価 ${float(p['avg_entry_price']):.2f}"
+                )
+    except Exception:
+        pass
+
+    # 発注詳細
+    if executed:
+        lines += ["", "── 発注ログ ─────────────────────────────────"]
+        for e in executed:
+            lines.append(
+                f"  {e['symbol']} {e['side']} x{e['qty']}"
+                f"  order_id={e['order_id']}"
+            )
+            lines.append(f"    → {e['rationale'][:80]}")
+
+    lines.append("══════════════════════════════════════════════")
+
+    report_text = "\n".join(lines)
+    logger.info(report_text)
+
+    # ファイル保存
+    report_path = Path(f"logs/session_report_{session_start.strftime('%Y%m%d_%H%M')}.txt")
+    report_path.parent.mkdir(exist_ok=True)
+    report_path.write_text(report_text, encoding="utf-8")
+    logger.info(f"レポート保存: {report_path}")
+
+
+# ──────────────────────────────────────────────────
+# ScalpDay_US（米国株デイトレ）セッション
+# ──────────────────────────────────────────────────
+
+
+def run_scalpday_us_session(duration_minutes: int | None = None):
     """
-    米国株デイトレペーパーセッション（毎日22:30 JST想定）。
+    ScalpDay_US セッション（毎日 23:35 JST 想定）。
     Alpaca paper-API に接続し、エージェントの提案を実際にペーパー発注する。
-    結果は logs/us_daytrade_log.json に保存する。
+    duration_minutes: 指定時間（分）が経過したら全決済してレポートを出す。
+    結果は logs/scalpday_us_log.json に保存する。
     """
-    import json as _json
-    from pathlib import Path
-    from datetime import datetime as _dt
+    if not is_us_open():
+        logger.info("NYSE 閉場/時間外 → ScalpDay_US セッションをスキップ")
+        return
+
     from brokers.alpaca import AlpacaBroker
     from data import us_market as us_mkt
-    from agents.critic_us import CriticUSAgent
     from agents.fx_strategy import FXStrategyAgent
 
-    logger.info("=== 米国株デイトレセッション開始 ===")
+    label = f"[{duration_minutes}分限定]" if duration_minutes else ""
+    logger.info(f"=== ScalpDay_US セッション開始 {label} ===")
+    _prevent_sleep()
 
-    cio            = CIOAgent()
-    daytrade_agent = DaytradeAgent()
-    critic         = CriticUSAgent()
-    fx_agent       = FXStrategyAgent()
-    broker         = AlpacaBroker()
+    cio              = CIOAgent()
+    scalpday_us_agent = ScalpDay_US()
+    critic            = ScalpDay_US_Critic()
+    fx_agent          = FXStrategyAgent()
+    broker            = AlpacaBroker()
 
     # 1. 口座確認
     acct = broker.get_account()
@@ -550,39 +878,53 @@ def run_us_paper_session():
 
     # 2. MarketContext 生成
     logger.info("CIO: マーケットコンテキスト生成中...")
-    macro_data = "USD/JPY=155.2, VIX=18.5, 米10Y=4.35%, S&P500先物=+0.3%"
+    _news, _obs = get_news_summary_for_cio()
     ctx = cio.generate_market_context(
-        news_summary="（米国株デイトレセッション）",
-        macro_data=macro_data,
+        news_summary=_news,
+        macro_data=_MACRO_DATA,
+        obs_source=_obs,
     )
     logger.info(f"コンテキスト: risk={ctx.risk_level}, rotation={ctx.rotation_signal}")
 
-    if ctx.risk_level == "high":
-        logger.warning("リスク水準 HIGH のためセッションを中止します")
-        _save_us_daytrade_log([], ctx.risk_level, "high_risk_abort")
-        return
-
-    # 3. FX シグナル
+    # 3. FX シグナル（配分ゲートで usd_jpy_rate を使うため先に取得）
     logger.info("FX戦略シグナル取得中...")
-    fx_signal = fx_agent.generate_signal(macro_data, 0.35, ctx)
+    fx_signal = fx_agent.generate_signal(_MACRO_DATA, 0.35, ctx)
     logger.info(
         f"FXシグナル: {fx_signal.get('fx_signal')} "
         f"us_weight_bias={fx_signal.get('us_weight_bias')}"
     )
+    usd_jpy_rate = float(fx_signal.get("usd_jpy_rate", 155.0))
 
-    # 4. バリューポジション銘柄を除外（デイトレ対象から外す）
+    # 配分ゲート（usd_jpy_rate は FXStrategyAgent 由来）
+    allocs = cio.allocate_budgets(ctx, total_cash_jpy=0, cash_usd=float(acct.get("cash", 0)), usd_jpy_rate=usd_jpy_rate)
+    if allocs["ScalpDay_US"].budget_usd == 0:
+        logger.warning(f"配分ゲート: ScalpDay_US 枠ゼロ (risk={ctx.risk_level}) → セッション中止")
+        _save_scalpday_us_log([], ctx.risk_level, "gate_abort")
+        return
+
+    # 4. MomentSwingUS ポジション銘柄を除外（デイトレ対象から外す）
     value_positions = {p.get("symbol") for p in broker.get_positions()}
 
     # 5. ユニバース構築・スクリーニング
     logger.info("米国株ユニバース構築中...")
-    universe = us_mkt.build_us_universe(_US_BASE_SYMBOLS)
-    candidates = [c for c in daytrade_agent.screen_candidates(universe, ctx)
+    _us_alloc = allocs["ScalpDay_US"]
+    universe = build_pod_universe("US", _us_alloc.active_sectors, _us_alloc.catalyst_slots)
+    candidates = [c for c in scalpday_us_agent.screen_candidates(universe, ctx)
                   if c not in value_positions]
-    logger.info(f"デイトレ候補銘柄: {candidates}")
+    logger.info(f"ScalpDayUS 候補銘柄: {candidates}")
     if not candidates:
-        logger.info("本日のデイトレ対象なし。終了します")
-        _save_us_daytrade_log([], ctx.risk_level, "no_candidates")
+        logger.info("本日の ScalpDayUS 対象なし。終了します")
+        _save_scalpday_us_log([], ctx.risk_level, "no_candidates")
         return
+
+    # ── 準備フェーズ完了。市場オープン（ET 9:30 = JST 22:30）まで待機 ──
+    wait_until("22:30")
+    session_start = datetime.now()
+    session_end_time = (
+        session_start + timedelta(minutes=duration_minutes) if duration_minutes else None
+    )
+    if session_end_time:
+        logger.info(f"タイムリミット: {session_end_time.strftime('%H:%M')} に全決済")
 
     # 6. 各候補: 提案 → CriticUS → ペーパー発注
     executed: list[dict] = []
@@ -594,7 +936,7 @@ def run_us_paper_session():
             bars_5min = us_mkt.get_bars_5min_us(symbol)
             sym_name  = next((u["name"] for u in universe if u["symbol"] == symbol), symbol)
 
-            proposal = daytrade_agent.generate_trade_proposal(
+            proposal = scalpday_us_agent.generate_trade_proposal(
                 symbol=symbol,
                 symbol_name=sym_name,
                 board_data=quote,
@@ -605,7 +947,6 @@ def run_us_paper_session():
                 continue
 
             # USD建て株数を max_us_position_usd 上限で再計算
-            # DaytradeAgent の qty は JPY 前提なので USD 銘柄には使えない
             max_pos_usd = float(getattr(RISK, "max_us_position_usd", 3000))
             current_price_usd = quote.get("CurrentPrice", 0)
             if current_price_usd > 0:
@@ -619,14 +960,15 @@ def run_us_paper_session():
                 proposal.stop_loss = sl_price
                 logger.info(f"{symbol}: ATRベースstop_loss={sl_price:.4f} (ATR={atr_pct:.2f}%)")
 
-            # CriticUS審査（否決なら daytrade_agent に修正依頼して再審査）
-            proposal, verdict = _refine_and_review(
-                daytrade_agent, proposal, critic, ctx, acct, fx_signal
+            # CriticUS審査（否決なら scalpday_us_agent に修正依頼して再審査）
+            approved_proposal, verdict = critic.refine_and_review(
+                scalpday_us_agent, proposal, ctx, account=acct, fx_signal=fx_signal
             )
-            if not verdict.approved:
+            if approved_proposal is None:
                 logger.info(f"{symbol}: クリティーク最終否決 — {verdict.suggestion}")
                 rejected.append({"symbol": symbol, "reason": verdict.suggestion})
                 continue
+            proposal = approved_proposal
 
             # ペーパー発注
             if proposal.price and proposal.price > 0:
@@ -636,7 +978,7 @@ def run_us_paper_session():
 
             if result.success:
                 logger.info(
-                    f"[デイトレ発注] {symbol} {proposal.side} x{proposal.qty} "
+                    f"[ScalpDayUS 発注] {symbol} {proposal.side} x{proposal.qty} "
                     f"order_id={result.order_id}"
                 )
                 executed.append({
@@ -654,292 +996,514 @@ def run_us_paper_session():
         except Exception as e:
             logger.error(f"{symbol} 処理中エラー: {e}", exc_info=True)
 
-    _save_us_daytrade_log(executed, ctx.risk_level, "orders_sent", rejected)
+    _save_scalpday_us_log(executed, ctx.risk_level, "orders_sent", rejected)
 
-    # ── ポジション監視ループ（引けまで） ──────────────────────────
-    daytrade_symbols: set[str] = {e["symbol"] for e in executed}
-    _STOP_LOSS_PCT  = -0.015   # -1.5% で損切り
-    _TAKE_PROFIT_PCT = 0.025   # +2.5% で利確
+    # ── ポジション管理 + 再スクリーニングループ ──────────────────────────
+    _STOP_LOSS_PCT   = -0.015  # -1.5% で損切り
+    _TAKE_PROFIT_PCT =  0.025  # +2.5% で利確
+    _RESCAN_SEC      = 300     # 5分ごとに再スクリーニング
+    poll_sec = 30 if duration_minutes else 120
 
-    logger.info(f"監視ループ開始: {daytrade_symbols} （引けまで継続）")
-    while daytrade_symbols and not is_near_us_close():
-        time.sleep(120)  # 2分ごとチェック
+    # 発注済み銘柄の管理マップ（symbol → 発注情報）
+    active_positions: dict[str, dict] = {
+        e["symbol"]: {"side": e["side"], "qty": e["qty"], "order_id": e["order_id"]}
+        for e in executed
+    }
+    all_executed = list(executed)   # 全発注履歴（最終レポート用）
+    last_rescan  = session_start
+
+    logger.info(
+        f"管理ループ開始: 初期ポジション={list(active_positions.keys())}"
+        + (f" （{duration_minutes}分後に全決済）" if duration_minutes else " （引けまで継続）")
+    )
+
+    while not is_near_us_close():
+        # タイムリミット到達チェック
+        if session_end_time and datetime.now() >= session_end_time:
+            logger.info("タイムリミット到達 → 全決済フェーズへ")
+            break
+
+        time.sleep(poll_sec)
+
+        # ── 1. 既存ポジションの SL/TP チェック ────────────────────────
+        just_closed: list[str] = []
         try:
             positions = broker.get_positions()
             pos_map   = {p["symbol"]: p for p in positions}
-            for symbol in list(daytrade_symbols):
+            for symbol in list(active_positions.keys()):
                 pos = pos_map.get(symbol)
                 if not pos:
-                    daytrade_symbols.discard(symbol)
+                    active_positions.pop(symbol, None)
                     continue
                 entry   = float(pos["avg_entry_price"])
                 current = float(pos["current_price"])
                 chg     = (current - entry) / entry if entry > 0 else 0.0
+                logger.info(f"  {symbol}: {chg:+.2%}  現在${current:.2f}")
                 if chg <= _STOP_LOSS_PCT:
-                    logger.warning(f"損切り: {symbol} {chg:+.2%} → 全決済")
+                    logger.warning(f"損切り: {symbol} {chg:+.2%} → 決済")
                     broker.close_position(symbol)
-                    daytrade_symbols.discard(symbol)
+                    active_positions.pop(symbol, None)
+                    just_closed.append(symbol)
                 elif chg >= _TAKE_PROFIT_PCT:
-                    logger.info(f"利確: {symbol} {chg:+.2%} → 全決済")
+                    logger.info(f"利確: {symbol} {chg:+.2%} → 決済")
                     broker.close_position(symbol)
-                    daytrade_symbols.discard(symbol)
+                    active_positions.pop(symbol, None)
+                    just_closed.append(symbol)
         except Exception as e:
             logger.error(f"監視ループエラー: {e}")
 
-    # 引け前強制決済（デイトレポジションのみ）
-    logger.info("引け前強制決済フェーズ")
-    for symbol in list(daytrade_symbols):
+        # ── 2. 5分ごと or 決済直後の再スクリーニング ──────────────────
+        now = datetime.now()
+        do_rescan = (now - last_rescan).total_seconds() >= _RESCAN_SEC or bool(just_closed)
+        if not do_rescan:
+            continue
+
+        last_rescan = now
+        logger.info(f"再スクリーニング: {'決済直後' if just_closed else '定期'}")
+        try:
+            new_universe = build_pod_universe("US", _us_alloc.active_sectors, _us_alloc.catalyst_slots)
+            # 現在Alpacaで保有中の全銘柄を除外（デイトレ・スイング問わず）
+            held = {p.get("symbol") for p in broker.get_positions()}
+            new_candidates = [
+                c for c in scalpday_us_agent.screen_candidates(new_universe, ctx)
+                if c not in held
+            ]
+            # 決済直後の銘柄を先頭に（再エントリーを優先試行）
+            priority = [s for s in just_closed if s in new_candidates]
+            others   = [c for c in new_candidates if c not in priority]
+
+            for symbol in priority + others:
+                if symbol in active_positions:
+                    continue
+                sym_name = next((u["name"] for u in new_universe if u["symbol"] == symbol), symbol)
+                label = "再エントリー" if symbol in just_closed else "新規エントリー"
+                logger.info(f"[{label}] {symbol} 試行...")
+                try:
+                    quote     = us_mkt.get_quote_us(symbol)
+                    bars_5min = us_mkt.get_bars_5min_us(symbol)
+                    proposal  = scalpday_us_agent.generate_trade_proposal(
+                        symbol=symbol, symbol_name=sym_name,
+                        board_data=quote, bars_5min=bars_5min, ctx=ctx,
+                    )
+                    if not proposal:
+                        continue
+
+                    cur_price = quote.get("CurrentPrice", 0)
+                    max_pos   = float(getattr(RISK, "max_us_position_usd", 3000))
+                    if cur_price > 0:
+                        proposal.qty = max(1, int(max_pos / cur_price))
+                    if proposal.stop_loss is None and cur_price > 0:
+                        uni_item       = next((u for u in new_universe if u["symbol"] == symbol), {})
+                        atr_pct        = float(uni_item.get("atr_pct", 2.0))
+                        proposal.stop_loss = round(cur_price * (1 - 1.5 * atr_pct / 100), 4)
+
+                    approved_proposal, verdict = critic.refine_and_review(
+                        scalpday_us_agent, proposal, ctx, account=acct, fx_signal=fx_signal
+                    )
+                    if approved_proposal is None:
+                        logger.info(f"[{label}否決] {symbol}: {verdict.suggestion}")
+                        rejected.append({"symbol": symbol, "reason": verdict.suggestion})
+                        continue
+                    proposal = approved_proposal
+
+                    if proposal.price and proposal.price > 0:
+                        result = broker.send_limit_order(symbol, proposal.qty, proposal.side, proposal.price)
+                    else:
+                        result = broker.send_market_order(symbol, proposal.qty, proposal.side)
+
+                    if result.success:
+                        logger.info(
+                            f"[{label}発注] {symbol} {proposal.side} x{proposal.qty} "
+                            f"order_id={result.order_id}"
+                        )
+                        active_positions[symbol] = {
+                            "side": proposal.side, "qty": proposal.qty, "order_id": result.order_id,
+                        }
+                        all_executed.append({
+                            "symbol":    symbol,
+                            "name":      sym_name,
+                            "side":      proposal.side,
+                            "qty":       proposal.qty,
+                            "rationale": proposal.rationale,
+                            "order_id":  result.order_id,
+                        })
+                    else:
+                        logger.warning(f"[{label}発注失敗] {symbol}: {result.message}")
+                except Exception as e:
+                    logger.error(f"{label} {symbol} エラー: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"再スクリーニングエラー: {e}")
+
+    # ── 強制決済フェーズ ──────────────────────────────────────────
+    close_reason = "タイムリミット" if (session_end_time and datetime.now() >= session_end_time) else "引け前"
+    logger.info(f"{close_reason}強制決済フェーズ")
+    for symbol in list(active_positions.keys()):
         try:
             positions = broker.get_positions()
             if any(p["symbol"] == symbol for p in positions):
-                logger.info(f"引け強制決済: {symbol}")
+                logger.info(f"強制決済: {symbol}")
                 broker.close_position(symbol)
         except Exception as e:
-            logger.error(f"引け決済エラー {symbol}: {e}")
+            logger.error(f"決済エラー {symbol}: {e}")
 
-    _save_us_daytrade_log(executed, ctx.risk_level, "completed", rejected)
-    logger.info(f"=== 米国株デイトレセッション終了: 発注{len(executed)}件 ===")
+    _save_scalpday_us_log(all_executed, ctx.risk_level, "completed", rejected)
+
+    if duration_minutes:
+        _generate_session_report(all_executed, broker, session_start, fx_signal, ctx)
+
+    _allow_sleep()
+    logger.info(f"=== ScalpDay_US セッション終了: 総発注{len(all_executed)}件 ===")
 
 
-def _save_us_daytrade_log(
+def _save_scalpday_us_log(
     executed: list[dict],
     risk_level: str,
     status: str,
     rejected: list[dict] | None = None,
 ) -> None:
-    import json as _json
-    from pathlib import Path
-    from datetime import datetime as _dt
-
-    log_path = Path("logs/us_daytrade_log.json")
+    log_path = Path("logs/scalpday_us_log.json")
     log_path.parent.mkdir(exist_ok=True)
     existing: list[dict] = []
     if log_path.exists():
         try:
-            existing = _json.loads(log_path.read_text(encoding="utf-8"))
+            existing = json.loads(log_path.read_text(encoding="utf-8"))
         except Exception:
             pass
     existing.append({
-        "session_date": _dt.now().isoformat(),
+        "session_date": datetime.now().isoformat(),
         "risk_level":   risk_level,
         "status":       status,
         "executed":     executed,
         "rejected":     rejected or [],
     })
     log_path.write_text(
-        _json.dumps(existing[-30:], ensure_ascii=False, indent=2),
+        json.dumps(existing[-30:], ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    logger.info(f"デイトレログ保存: {log_path}")
+    logger.info(f"ScalpDayUSログ保存: {log_path}")
 
 
 # ──────────────────────────────────────────────────────────────────
-# 情報収集・議論セッション（毎日 23:00）
+# FX リバランスセッション
 # ──────────────────────────────────────────────────────────────────
 
-def run_intelligence_session():
+
+def run_fx_rebalance_session():
     """
-    毎日 23:00 に実行するインテリジェンス収集・議論セッション。
-    1. IntelligenceAgent でシグナル収集（arxiv / GitHub / HackerNews）
-    2. CriticIntelligenceAgent で審査
-    3. relevance_score >= 0.75 のシグナルについてエージェント議論
-    4. 結果を logs/discussion_log.json に追記保存
+    FX リバランスセッション（JP/US どちらかの市場が通常立会時間のとき実行）。
+
+    マクロデータを読み、FX シグナルを生成・審査後にポジション調整意図をログ出力する。
+    情報収集は IntelScout の役割。本セッションはマクロデータを読むだけで収集はしない。
+    両市場とも閉場なら発注・建玉操作を一切行わず早期リターンする。
     """
-    import json as _json
-    from pathlib import Path
-    from datetime import datetime as _dt
-    from agents.intelligence import IntelligenceAgent
-    from agents.critic_intelligence import CriticIntelligenceAgent
-    from agents.discussion import DiscussionOrchestratorAgent
-    from agents.equity import EquityAgent
+    if not (is_jp_open() or is_us_open()):
+        logger.info("両市場閉場 → FXリバランス見送り")
+        return
+
     from agents.fx_strategy import FXStrategyAgent
-    from agents.risk_manager import RiskManagerAgent
 
-    logger.info("=== インテリジェンスセッション開始 ===")
+    logger.info("=== FXリバランスセッション開始 ===")
+    _prevent_sleep()
 
-    intel_agent  = IntelligenceAgent()
-    critic_intel = CriticIntelligenceAgent()
-    discussion   = DiscussionOrchestratorAgent()
-    cio          = CIOAgent()
-    equity       = EquityAgent()
-    fx           = FXStrategyAgent()
-    risk         = RiskManagerAgent()
+    cio      = CIOAgent()
+    fx_agent = FXStrategyAgent()
+    critic   = FXRebalance_Critic()
 
-    # 1. MarketContext 生成
+    # 1. MarketContext 生成（マクロデータは _MACRO_DATA のみ参照、収集はしない）
     logger.info("CIO: マーケットコンテキスト生成中...")
-    macro_data = "USD/JPY=155.2, VIX=18.5, 米10Y=4.35%, S&P500先物=フラット"
+    _news, _obs = get_news_summary_for_cio()
     ctx = cio.generate_market_context(
-        news_summary="（インテリジェンスセッション用コンテキスト）",
-        macro_data=macro_data,
+        news_summary=_news,
+        macro_data=_MACRO_DATA,
+        obs_source=_obs,
     )
     logger.info(f"コンテキスト: risk={ctx.risk_level}, rotation={ctx.rotation_signal}")
 
-    # 2. シグナル収集
-    logger.info("情報収集中（arxiv / GitHub / HackerNews）...")
-    raw_result   = intel_agent.collect(ctx)
-    raw_signals  = raw_result.get("signals", [])
-    logger.info(f"収集シグナル数: {len(raw_signals)} 件")
+    # 2. FX シグナル生成
+    logger.info("FXStrategyAgent: シグナル生成中...")
+    fx_signal = fx_agent.generate_signal(_MACRO_DATA, 0.35, ctx)
+    logger.info(
+        f"FXシグナル: {fx_signal.get('fx_signal')} "
+        f"目標ドル比率={fx_signal.get('target_usd_ratio')}%"
+    )
 
-    if not raw_signals:
-        logger.info("シグナルなし。セッション終了")
+    # 3. FXRebalance_Critic 審査
+    logger.info("FXRebalance_Critic: 審査中...")
+    verdict = critic.review_signal(fx_signal, ctx)
+    logger.info(f"審査結果: approved={verdict.approved} score={verdict.score:.2f}")
+
+    if not verdict.approved:
+        issues_str = "; ".join(verdict.issues or [])
+        logger.info(f"FXリバランス否決: {issues_str}")
+        _allow_sleep()
         return
 
-    # 3. クリティーク審査
-    logger.info("CriticIntelligence: シグナル審査中...")
-    approved_signals = critic_intel.review(raw_signals, ctx)
-    logger.info(f"承認シグナル数: {len(approved_signals)} 件")
+    # 4. リバランス実行（発注意図をログ出力。実 FX 発注はブローカー接続後に実装）
+    target  = float(fx_signal.get("target_usd_ratio",  50))
+    current = float(fx_signal.get("current_usd_ratio", 50))
+    diff    = target - current
 
-    # 4. 高スコアシグナルの議論
-    high_score = [s for s in approved_signals if s.get("relevance_score", 0) >= 0.75]
-    logger.info(f"議論対象シグナル数: {len(high_score)} 件（score >= 0.75）")
-
-    discussion_results: list[dict] = []
-    for signal in high_score:
+    if abs(diff) < 1.0:
+        logger.info("ドル比率の変更不要（差分 < 1%）。リバランス見送り")
+    else:
+        direction = "ドル増加" if diff > 0 else "ドル削減"
         logger.info(
-            f"議論開始: [{signal.get('relevance_score', 0):.2f}] "
-            f"{signal.get('title', '')[:60]}"
+            f"FXリバランス実行: {direction} "
+            f"現在={current:.1f}% → 目標={target:.1f}%（差分={diff:+.1f}%）"
         )
-        result = discussion.run(
-            signal, ctx,
-            cio_agent=cio,
-            equity_agent=equity,
-            fx_agent=fx,
-            risk_agent=risk,
-        )
-        discussion_results.append(result)
 
-    # 5. logs/discussion_log.json に追記保存
-    log_path = Path("logs/discussion_log.json")
-    log_path.parent.mkdir(exist_ok=True)
+    _allow_sleep()
+    logger.info("=== FXリバランスセッション終了 ===")
 
-    session_record = {
-        "session_date":      _dt.now().isoformat(),
-        "signals_found":     len(raw_signals),
-        "signals_approved":  len(approved_signals),
-        "signals_discussed": len(high_score),
-        "approved_signals":  approved_signals,
-        "discussions":       discussion_results,
-    }
 
-    existing: list[dict] = []
-    if log_path.exists():
-        try:
-            existing = _json.loads(log_path.read_text(encoding="utf-8"))
-        except (_json.JSONDecodeError, OSError):
-            existing = []
+# ──────────────────────────────────────────────────────────────────
+# IntelScout 収集セッション（1日2回: 08:00/17:00 JST）
+# ──────────────────────────────────────────────────────────────────
 
-    existing.append(session_record)
-    existing = existing[-30:]  # 最新 30 セッションのみ保持
-    log_path.write_text(
-        _json.dumps(existing, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+
+def run_intel_scout_session():
+    """
+    IntelScout 収集セッション（08:00/17:00 JST 想定）。
+    市場ガードなし（7日稼働、情報蓄積を止めない）。
+    前回収集時刻からの差分を収集し、ロールアップを生成・保存する。
+    完了後に CIO キャッシュを無効化して、以降のセッションが
+    ダイジェスト付きコンテキストを取得できるようにする。
+    """
+    from agents.intelligence import IntelligenceAgent
+    from zoneinfo import ZoneInfo
+
+    logger.info("=== IntelScout 収集セッション開始 ===")
+    _prevent_sleep()
+
+    _JST_ZONE  = ZoneInfo("Asia/Tokyo")
+    now        = datetime.now(_JST_ZONE)
+    date_str   = now.strftime("%Y-%m-%d")
+    window_lbl = now.strftime("%H:%M")
+
+    # 1. 前回収集時刻を読み込み、since を決定
+    state = load_state()
+    last  = state.last_collected_at
+
+    _FALLBACK_H     = 24
+    _MAX_LOOKBACK_H = 48
+
+    if last is None:
+        logger.info(f"初回起動 → {_FALLBACK_H}h 前からフォールバック収集")
+        since = now - timedelta(hours=_FALLBACK_H)
+    else:
+        age_h = (now - last).total_seconds() / 3600
+        if age_h > _MAX_LOOKBACK_H:
+            logger.warning(
+                f"最終収集から {age_h:.0f}h 経過（上限 {_MAX_LOOKBACK_H}h）。"
+                f"{_FALLBACK_H}h フォールバックを使用"
+            )
+            since = now - timedelta(hours=_FALLBACK_H)
+        else:
+            logger.info(f"前回収集: {last.isoformat()} ({age_h:.1f}h 前)")
+            since = last
+
+    # 2. シグナル収集（差分）
+    intel_agent = IntelligenceAgent()
+    critic      = IntelCritic()
+
+    logger.info(f"差分収集: {since.isoformat()} 以降...")
+    raw_result  = intel_agent.collect(since=since)
+    raw_signals = raw_result.get("signals", [])
+    logger.info(f"収集シグナル数: {len(raw_signals)} 件")
+
+    # 3. IntelCritic 審査（ctx 不要）
+    approved: list[dict] = []
+    if raw_signals:
+        logger.info("IntelCritic: 審査中...")
+        approved = critic.review_signals(raw_signals)
+        logger.info(f"承認シグナル数: {len(approved)} 件")
+
+    # 4. 既存ダイジェストから同日の収集窓を引き継ぐ
+    existing_digest  = read_intel_digest()
+    existing_windows = (
+        existing_digest.get("windows", [])
+        if existing_digest.get("date") == date_str
+        else []
     )
-    logger.info(f"議論ログ保存: {log_path}")
 
-    # 6. セッションサマリー出力
-    execute_count = sum(1 for r in discussion_results if r.get("verdict") == "execute")
-    defer_count   = sum(1 for r in discussion_results if r.get("verdict") == "defer")
-    reject_count  = sum(1 for r in discussion_results if r.get("verdict") == "reject")
+    # 5. ロールアップ生成
+    logger.info("ロールアップ生成中...")
+    rollup = intel_agent.generate_rollup(
+        approved,
+        date_str=date_str,
+        window=window_lbl,
+        existing_windows=existing_windows,
+    )
+
+    # 6. ダイジェスト保存（JSON + Markdown）
+    write_intel_digest(rollup)
     logger.info(
-        f"議論サマリー: execute={execute_count} / defer={defer_count} / reject={reject_count}"
+        f"ダイジェスト保存: logs/intel_digest.json + "
+        f"logs/digests/{date_str}.md  "
+        f"(signal_count={rollup['signal_count']})"
     )
-    for result in discussion_results:
-        logger.info(
-            f"  [{result.get('verdict', '?')}] {result.get('signal_title', '')[:60]}"
+
+    # 7. CIO キャッシュを無効化（以降のセッションがダイジェスト付きコンテキストを取得するため）
+    _cio_cache = Path("logs/market_context_cache.json")
+    if _cio_cache.exists():
+        _cio_cache.unlink()
+        logger.info("CIO キャッシュ無効化: 次回セッションでダイジェストが反映されます")
+
+    # 8. 収集時刻を更新
+    state.last_collected_at = now
+    save_state(state)
+    logger.info(f"状態更新: last_collected_at = {now.isoformat()}")
+
+    _allow_sleep()
+    logger.info("=== IntelScout 収集セッション終了 ===")
+
+
+# ──────────────────────────────────────────────────
+
+def _collect_report_data(macro_data: str = _MACRO_DATA) -> "tuple":
+    """
+    朝・夜レポート共通のデータ収集。
+    各ブローカー/エージェントを初期化してデータを取得し返す。
+    接続失敗時はデフォルト値で継続（システムを止めない）。
+
+    Returns: (ctx, fx_signal, jp_cash_jpy, usd_cash, us_equity_usd, us_positions, usdjpy_rate)
+    """
+    from agents.cio import CIOAgent
+    from agents.fx_strategy import FXStrategyAgent
+    from agents.base import MarketContext
+    from datetime import date
+
+    # MarketContext（CIO）
+    ctx: MarketContext
+    try:
+        _news, _obs = get_news_summary_for_cio()
+        ctx = CIOAgent().generate_market_context(
+            news_summary=_news,
+            macro_data=macro_data,
+            obs_source=_obs,
+        )
+    except Exception as exc:
+        logger.warning(f"CIOコンテキスト取得失敗: {exc}")
+        from agents.base import MarketContext
+        ctx = MarketContext(
+            date=date.today().isoformat(),
+            sector_scores={},
+            macro_notes="データ取得失敗",
+            rotation_signal="維持",
+            risk_level="medium",
         )
 
-    logger.info("=== インテリジェンスセッション（初回）終了 ===")
+    # FXシグナル
+    fx_signal: dict = {}
+    try:
+        fx_signal = FXStrategyAgent().generate_signal(macro_data, 0.35, ctx)
+    except Exception as exc:
+        logger.warning(f"FXシグナル取得失敗: {exc}")
+    usdjpy_rate = float(fx_signal.get("usd_jpy_rate", 155.0))
 
-    # 2時間ごとに再収集（6時まで）
-    session_end = _us_session_end()
-    while datetime.now() < session_end:
-        wait_sec = min(7200, int((session_end - datetime.now()).total_seconds()))
-        if wait_sec < 600:
-            break
-        logger.info(f"次回インテリジェンス収集まで {wait_sec // 60} 分待機...")
-        time.sleep(wait_sec if wait_sec <= 7200 else 7200)
-        if datetime.now() >= session_end:
-            break
-        logger.info("=== インテリジェンス再収集 ===")
-        try:
-            raw_result  = intel_agent.collect(ctx)
-            raw_signals = raw_result.get("signals", [])
-            logger.info(f"再収集シグナル数: {len(raw_signals)} 件")
-            approved    = critic_intel.review(raw_signals, ctx)
-            high_score  = [s for s in approved if s.get("relevance_score", 0) >= 0.75]
-            for signal in high_score:
-                result = discussion.run(signal, ctx, cio_agent=cio,
-                                        equity_agent=equity, fx_agent=fx, risk_agent=risk)
-                discussion_results.append(result)
-            # ログ追記保存（既存セッションを更新）
-            log_path = Path("logs/discussion_log.json")
-            existing = []
-            if log_path.exists():
-                try:
-                    existing = _json.loads(log_path.read_text(encoding="utf-8"))
-                except Exception:
-                    pass
-            if existing:
-                existing[-1]["discussions"].extend(discussion_results[-len(high_score):])
-                existing[-1]["signals_found"] += len(raw_signals)
-            log_path.write_text(_json.dumps(existing[-30:], ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception as e:
-            logger.error(f"インテリジェンス再収集エラー: {e}")
+    # kabu（日本株）現金残高
+    jp_cash_jpy = 0.0
+    try:
+        from brokers.kabu import KabuBroker
+        wallet = KabuBroker().get_wallet_margin()
+        jp_cash_jpy = float(wallet.get("MarginAccountWallet", 0))
+    except Exception as exc:
+        logger.warning(f"kabu接続失敗: {exc}")
 
-    logger.info("=== インテリジェンスセッション終了（全サイクル完了） ===")
+    # Alpaca（米国株）口座・ポジション
+    usd_cash = us_equity_usd = 0.0
+    us_positions: list[dict] = []
+    try:
+        from brokers.alpaca import AlpacaBroker
+        alpaca  = AlpacaBroker()
+        acct    = alpaca.get_account()
+        usd_cash      = float(acct.get("cash", 0))
+        us_equity_usd = float(acct.get("equity", 0))
+        us_positions  = alpaca.get_positions()
+    except Exception as exc:
+        logger.warning(f"Alpaca接続失敗: {exc}")
+
+    return ctx, fx_signal, jp_cash_jpy, usd_cash, us_equity_usd, us_positions, usdjpy_rate
 
 
 def run_morning_report() -> str:
     """
-    朝 6 時レポート：
-    1. テキストサマリーをログ出力
-    2. CxOAgent でHTMLレポートを生成してメール送信
+    朝 6 時レポート：データを収集し CxOAgent に渡してHTMLレポートをメール送信する。
+    CIO / FX / Broker / ScalpDay_JP の初期化はここで行い CXO には注入する。
     """
-    import json as _json
-    from pathlib import Path
-    from agents.cxo import CXOAgent
+    from agents.cxo import CXOAgent, CXOReportContext
+    from agents.scalp_day import ScalpDay_JP
+    from brokers.alpaca import AlpacaBroker, calc_daytrade_pl
+    from report.template import DaytradeCandidate
 
-    lines = [f"=== 朝次レポート {datetime.now().strftime('%Y-%m-%d %H:%M')} ==="]
+    logger.info(f"=== 朝次レポート生成開始 {datetime.now().strftime('%Y-%m-%d %H:%M')} ===")
 
-    log_path = Path("logs/discussion_log.json")
-    if log_path.exists():
-        try:
-            sessions = _json.loads(log_path.read_text(encoding="utf-8"))
-            if sessions:
-                latest = sessions[-1]
-                lines.append(f"\n【インテリジェンス議論サマリー（{latest['session_date'][:10]}）】")
-                lines.append(f"  収集シグナル: {latest.get('signals_found', 0)} 件")
-                lines.append(f"  承認シグナル: {latest.get('signals_approved', 0)} 件")
-                for disc in latest.get("discussions", []):
-                    verdict = disc.get("verdict", "?")
-                    title   = disc.get("signal_title", "")[:50]
-                    score   = disc.get("signal_score", 0)
-                    lines.append(f"  [{verdict}] ({score:.2f}) {title}")
-        except (_json.JSONDecodeError, OSError, KeyError):
-            lines.append("  議論ログ読み込み失敗")
-    else:
-        lines.append("  議論ログなし（インテリジェンスセッション未実行）")
+    # 共通データ収集
+    ctx, fx_signal, jp_cash_jpy, usd_cash, us_equity_usd, us_positions, usdjpy_rate = (
+        _collect_report_data()
+    )
 
-    report = "\n".join(lines)
-    logger.info(report)
-
-    # HTMLレポートをメール送信
+    # Alpaca 約定履歴（デイトレ損益計算）
+    daytrade_pl: dict | None = None
     try:
-        CXOAgent().generate_morning_report()
+        activities  = AlpacaBroker().get_activities(since_hours=24)
+        daytrade_pl = calc_daytrade_pl(activities)
+    except Exception as exc:
+        logger.warning(f"デイトレ損益計算失敗: {exc}")
+
+    # ScalpDay_JP 候補スクリーニング
+    daytrade_candidates: list[DaytradeCandidate] = []
+    try:
+        from agents.cio import CIOAgent
+        cio    = CIOAgent()
+        allocs = cio.allocate_budgets(ctx, total_cash_jpy=jp_cash_jpy or 500_000, cash_usd=0)
+        alloc  = allocs["ScalpDay_JP"]
+        universe = build_pod_universe("JP", alloc.active_sectors, alloc.catalyst_slots)
+        raw_cands = ScalpDay_JP().screen_candidates(universe, ctx)
+        for sym in raw_cands[:5]:
+            sym_name = next((u["name"] for u in universe if u["symbol"] == sym), sym)
+            daytrade_candidates.append(DaytradeCandidate(
+                symbol=sym, name=sym_name, signal="buy", rationale="スクリーニング通過",
+            ))
+    except Exception as exc:
+        logger.warning(f"デイトレ候補取得失敗: {exc}")
+
+    report_ctx = CXOReportContext(
+        ctx=ctx, fx_signal_dict=fx_signal, us_positions=us_positions,
+        jp_cash_jpy=jp_cash_jpy, usd_cash=usd_cash, us_equity_usd=us_equity_usd,
+        usdjpy_rate=usdjpy_rate,
+    )
+    try:
+        CXOAgent().generate_morning_report(
+            report_ctx,
+            daytrade_pl=daytrade_pl,
+            daytrade_candidates=daytrade_candidates,
+        )
     except Exception as exc:
         logger.error(f"朝次HTMLレポート送信失敗: {exc}", exc_info=True)
 
-    return report
+    return f"=== 朝次レポート {datetime.now().strftime('%Y-%m-%d %H:%M')} 完了 ==="
 
 
 def run_evening_report() -> None:
     """
-    夜 21 時レポート：CxOAgent でHTMLレポートを生成してメール送信する。
+    夜 21 時レポート：データを収集し CxOAgent に渡してHTMLレポートをメール送信する。
+    CIO / FX / Broker の初期化はここで行い CXO には注入する。
     """
-    from agents.cxo import CXOAgent
+    from agents.cxo import CXOAgent, CXOReportContext
+
     logger.info("=== 夜間レポート生成開始 ===")
+
+    ctx, fx_signal, jp_cash_jpy, usd_cash, us_equity_usd, us_positions, usdjpy_rate = (
+        _collect_report_data()
+    )
+    report_ctx = CXOReportContext(
+        ctx=ctx, fx_signal_dict=fx_signal, us_positions=us_positions,
+        jp_cash_jpy=jp_cash_jpy, usd_cash=usd_cash, us_equity_usd=us_equity_usd,
+        usdjpy_rate=usdjpy_rate,
+    )
     try:
-        CXOAgent().generate_evening_report()
+        CXOAgent().generate_evening_report(report_ctx)
     except Exception as exc:
         logger.error(f"夜間HTMLレポート送信失敗: {exc}", exc_info=True)
 
@@ -974,15 +1538,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         choices=[
-            "daytrade", "paper", "us_paper", "us_value",
-            "intelligence", "morning_report", "evening_report",
+            "scalpday_jp",
+            "moment_swing_jp",
+            "scalpday_us",
+            "moment_swing_us",
+            "fx_rebalance",
+            "intel_scout",
+            "morning_report",
+            "evening_report",
         ],
-        default="paper",
+        default="scalpday_jp",
         help=(
-            "実行モード: daytrade=日本株本番, paper=日本株ペーパー, "
-            "us_paper=米国株デイトレ, us_value=米国株バリュー中長期, "
-            "intelligence=情報収集・議論, "
-            "morning_report=朝次レポート(06:00), evening_report=夜間レポート(21:00)"
+            "実行モード: "
+            "scalpday_jp=日本株デイトレ, "
+            "moment_swing_jp=日本株スイング, "
+            "scalpday_us=米国株デイトレ(Alpaca), "
+            "moment_swing_us=米国株スイング中長期, "
+            "fx_rebalance=FXリバランス(JP/USどちらか開場時), "
+            "intel_scout=IntelScout収集(08:00/17:00 JST 市場ガードなし), "
+            "morning_report=朝次レポート(06:00), "
+            "evening_report=夜間レポート(21:00)"
         ),
     )
     parser.add_argument(
@@ -990,20 +1565,31 @@ if __name__ == "__main__":
         metavar="HH:MM",
         help="指定時刻まで待機してから実行する（例: --schedule 22:30）",
     )
+    parser.add_argument(
+        "--duration",
+        metavar="MINUTES",
+        type=int,
+        default=None,
+        help="scalpday_us モード: 指定分後に全決済してレポートを出す（例: --duration 10）",
+    )
     args = parser.parse_args()
 
     if args.schedule:
         wait_until(args.schedule)
 
-    if args.mode == "us_value":
-        run_us_value_session()
-    elif args.mode == "us_paper":
-        run_us_paper_session()
-    elif args.mode == "intelligence":
-        run_intelligence_session()
+    if args.mode == "scalpday_jp":
+        run_scalpday_jp_session(paper=True)
+    elif args.mode == "moment_swing_jp":
+        run_moment_swing_jp_session(paper=True)
+    elif args.mode == "moment_swing_us":
+        run_moment_swing_us_session()
+    elif args.mode == "scalpday_us":
+        run_scalpday_us_session(duration_minutes=args.duration)
+    elif args.mode == "fx_rebalance":
+        run_fx_rebalance_session()
+    elif args.mode == "intel_scout":
+        run_intel_scout_session()
     elif args.mode == "morning_report":
         run_morning_report()
     elif args.mode == "evening_report":
         run_evening_report()
-    else:
-        run_daytrade_session(paper=(args.mode == "paper"))

@@ -16,7 +16,11 @@ from anthropic import Anthropic
 from config.settings import LLM
 
 logger = logging.getLogger(__name__)
-_client = Anthropic(api_key=LLM.api_key)
+_client = Anthropic(
+    api_key=LLM.api_key,
+    timeout=120.0,   # 2分でタイムアウト（未設定だとリトライが数時間以上ハングする）
+    max_retries=2,
+)
 
 
 # ──────────────────────────────────────────────
@@ -25,12 +29,16 @@ _client = Anthropic(api_key=LLM.api_key)
 
 @dataclass
 class MarketContext:
-    """CIOエージェントが生成し、下位エージェントに渡す市場コンテキスト。"""
+    """CIOエージェントが生成し、下位エージェントに渡す市場コンテキスト。
+    観測層フィールド(sector_scores, macro_notes)はIntelScoutが生成し、
+    判断層フィールド(risk_level, rotation_signal)はCIOが確定する2層構造。
+    """
     date: str                          # "2026-06-10"
     sector_scores: dict[str, float]    # {"AI半導体": 0.85, "宇宙インフラ": 0.72, ...}
     macro_notes: str                   # マクロ環境の要約テキスト
     rotation_signal: str               # "AI半導体→エネルギー", "維持" など
     risk_level: str                    # "low" | "medium" | "high"
+    obs_generated_by: str = "CIO"     # 観測層の生成者（将来: "IntelScout" に移管）
 
 
 @dataclass
@@ -42,7 +50,7 @@ class TradeProposal:
     side: str                          # "buy" | "sell"
     qty: int | float
     price: float                       # 0=成行
-    strategy: str                      # "daytrade" | "swing" | "value"
+    strategy: str                      # "scalpday" | "momentum_swing"
     rationale: str                     # 判断根拠（LLMが生成した自然言語）
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
@@ -57,6 +65,21 @@ class CriticVerdict:
     issues: list[str]                  # 否決・修正が必要な理由
     suggestion: str                    # 修正案または「問題なし」
     fixable: bool = True               # False=修正しても無意味（市場時間外など）
+
+
+@dataclass
+class Allocation:
+    """CIOが各ポッドに割り当てる資金枠と活性セクター。
+    - budget_jpy / budget_usd がともに 0 = ゲートにより遮断。
+    - FXRebalanceポッドの budget_jpy は銘柄購入枠ではなく
+      「このセッションで動かしてよい最大円建て取引額」を表す。
+    - catalyst_slots: 活性セクター外でも出来高・値動きが異常な銘柄を
+      拾える例外枠数（0 = セクター外一切不可）。
+    """
+    budget_jpy: float = 0.0
+    budget_usd: float = 0.0
+    active_sectors: list[str] = field(default_factory=list)
+    catalyst_slots: int = 1            # カタリスト例外枠（活性セクター外の許容銘柄数）
 
 
 # ──────────────────────────────────────────────
