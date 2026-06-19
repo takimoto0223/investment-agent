@@ -1360,18 +1360,25 @@ def run_intel_scout_session():
 
 # ──────────────────────────────────────────────────
 
-def _collect_report_data(macro_data: str = _MACRO_DATA) -> "tuple":
+def _collect_report_data() -> "tuple":
     """
     朝・夜レポート共通のデータ収集。
     各ブローカー/エージェントを初期化してデータを取得し返す。
     接続失敗時はデフォルト値で継続（システムを止めない）。
 
-    Returns: (ctx, fx_signal, jp_cash_jpy, usd_cash, us_equity_usd, us_positions, usdjpy_rate)
+    Returns:
+        (ctx, fx_signal, jp_cash_jpy, usd_cash, us_equity_usd,
+         us_positions, usdjpy_rate, usdjpy_source, usdjpy_fetched_at)
     """
     from agents.cio import CIOAgent
     from agents.fx_strategy import FXStrategyAgent
     from agents.base import MarketContext
+    from data.fx_rate import get_usd_jpy
     from datetime import date
+
+    # 実勢 USD/JPY レート取得（タイムアウト4秒 → キャッシュ → 暫定値155.0）
+    usdjpy_rate, usdjpy_fetched_at, usdjpy_source = get_usd_jpy()
+    macro_data = f"USD/JPY={usdjpy_rate:.2f}, VIX=18.5, 米10Y=4.35%"
 
     # MarketContext（CIO）
     ctx: MarketContext
@@ -1399,7 +1406,6 @@ def _collect_report_data(macro_data: str = _MACRO_DATA) -> "tuple":
         fx_signal = FXStrategyAgent().generate_signal(macro_data, 0.35, ctx)
     except Exception as exc:
         logger.warning(f"FXシグナル取得失敗: {exc}")
-    usdjpy_rate = float(fx_signal.get("usd_jpy_rate", 155.0))
 
     # kabu（日本株）現金残高
     jp_cash_jpy = 0.0
@@ -1423,7 +1429,10 @@ def _collect_report_data(macro_data: str = _MACRO_DATA) -> "tuple":
     except Exception as exc:
         logger.warning(f"Alpaca接続失敗: {exc}")
 
-    return ctx, fx_signal, jp_cash_jpy, usd_cash, us_equity_usd, us_positions, usdjpy_rate
+    return (
+        ctx, fx_signal, jp_cash_jpy, usd_cash, us_equity_usd,
+        us_positions, usdjpy_rate, usdjpy_source, usdjpy_fetched_at,
+    )
 
 
 def run_morning_report() -> str:
@@ -1439,9 +1448,8 @@ def run_morning_report() -> str:
     logger.info(f"=== 朝次レポート生成開始 {datetime.now().strftime('%Y-%m-%d %H:%M')} ===")
 
     # 共通データ収集
-    ctx, fx_signal, jp_cash_jpy, usd_cash, us_equity_usd, us_positions, usdjpy_rate = (
-        _collect_report_data()
-    )
+    (ctx, fx_signal, jp_cash_jpy, usd_cash, us_equity_usd,
+     us_positions, usdjpy_rate, usdjpy_source, usdjpy_fetched_at) = _collect_report_data()
 
     # Alpaca 約定履歴（デイトレ損益計算）
     daytrade_pl: dict | None = None
@@ -1472,6 +1480,8 @@ def run_morning_report() -> str:
         ctx=ctx, fx_signal_dict=fx_signal, us_positions=us_positions,
         jp_cash_jpy=jp_cash_jpy, usd_cash=usd_cash, us_equity_usd=us_equity_usd,
         usdjpy_rate=usdjpy_rate,
+        usdjpy_source=usdjpy_source,
+        usdjpy_fetched_at=usdjpy_fetched_at,
     )
     try:
         CXOAgent().generate_morning_report(
@@ -1494,13 +1504,14 @@ def run_evening_report() -> None:
 
     logger.info("=== 夜間レポート生成開始 ===")
 
-    ctx, fx_signal, jp_cash_jpy, usd_cash, us_equity_usd, us_positions, usdjpy_rate = (
-        _collect_report_data()
-    )
+    (ctx, fx_signal, jp_cash_jpy, usd_cash, us_equity_usd,
+     us_positions, usdjpy_rate, usdjpy_source, usdjpy_fetched_at) = _collect_report_data()
     report_ctx = CXOReportContext(
         ctx=ctx, fx_signal_dict=fx_signal, us_positions=us_positions,
         jp_cash_jpy=jp_cash_jpy, usd_cash=usd_cash, us_equity_usd=us_equity_usd,
         usdjpy_rate=usdjpy_rate,
+        usdjpy_source=usdjpy_source,
+        usdjpy_fetched_at=usdjpy_fetched_at,
     )
     try:
         CXOAgent().generate_evening_report(report_ctx)

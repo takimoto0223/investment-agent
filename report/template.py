@@ -109,6 +109,8 @@ class EveningReportData:
     fx_signal: str = "中立"                             # "円買い" | "中立" | "ドル買い"
     fx_rationale: str = ""
     usdjpy_rate: float = 155.0
+    usdjpy_source: str = ""       # "api" | "cache" | "fallback"
+    usdjpy_fetched_at: str = ""   # "6/19" 形式（Frankfurter 日次更新）
     margin_positions: list = field(default_factory=list)  # list[MarginPosition]
     sector_scores: list = field(default_factory=list)     # list[SectorScore]
     all_positions: list = field(default_factory=list)     # list[HoldingItem]（JP+US合算）
@@ -137,6 +139,26 @@ class MorningReportData(EveningReportData):
     daytrade_net_pl: float = 0.0        # ネット損益 (USD)
     # バリュー投資決定
     swing_decisions: list = field(default_factory=list)       # list[SwingDecision]
+
+
+# ── USD/JPY ラベル生成（ソース・時点を明示）────────────────────────
+
+def _usdjpy_label(data: "EveningReportData") -> str:
+    """
+    レートと取得元を人間が読みやすい形式で返す。
+      api/cache → "157.42 (6/19時点)"  ※cacheは"キャッシュ"付き
+      fallback  → "155.00 ⚠ レート取得失敗・暫定値使用"
+    """
+    rate = data.usdjpy_rate
+    src  = getattr(data, "usdjpy_source", "")
+    at   = getattr(data, "usdjpy_fetched_at", "")
+    if src == "fallback":
+        return f'{rate:.2f} <span style="color:#dc2626;">⚠ レート取得失敗・暫定値使用</span>'
+    if src == "cache":
+        suffix = f" ({at}時点, キャッシュ)" if at else ""
+        return f"{rate:.2f}{suffix}"
+    suffix = f" ({at}時点)" if at else ""
+    return f"{rate:.2f}{suffix}"
 
 
 # ── ドーナツチャート（PNG base64、メールクライアント互換）──────────
@@ -586,7 +608,7 @@ def _build_base_rows(data: EveningReportData) -> list:
         f'<td style="font-size:12px;color:#6b7280;vertical-align:middle;">'
         f'{rationale}</td></tr></table>'
         f'<div style="font-size:11px;color:#9ca3af;margin-top:6px;">'
-        f'USD/JPY: {data.usdjpy_rate:.2f}</div>'
+        f'USD/JPY: {_usdjpy_label(data)}</div>'
     )))
 
     # 信用建玉の状況
@@ -687,7 +709,7 @@ def _build_morning_rows(data: MorningReportData) -> list:
         f'<table cellpadding="0" cellspacing="0"><tr>'
         f'<td style="padding-right:24px;vertical-align:top;">'
         f'<div style="font-size:20px;font-weight:bold;color:#111827;">'
-        f'USD/JPY {data.usdjpy_rate:.2f}</div>'
+        f'USD/JPY {_usdjpy_label(data)}</div>'
         f'<div style="font-size:12px;color:{fx_c};margin-top:2px;">'
         f'{fx_s}{data.overnight_fx_change_pct:.2f}%</div>'
         f'</td>'

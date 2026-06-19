@@ -51,10 +51,12 @@ class CXOReportContext:
     ctx:           MarketContext
     fx_signal_dict: dict          # FXStrategyAgent.generate_signal() の戻り値
     us_positions:  list[dict]     # AlpacaBroker.get_positions()
-    jp_cash_jpy:   float = 0.0   # KabuBroker.get_wallet_margin()["MarginAccountWallet"]
-    usd_cash:      float = 0.0   # AlpacaBroker.get_account()["cash"]
-    us_equity_usd: float = 0.0   # AlpacaBroker.get_account()["equity"]
-    usdjpy_rate:   float = _DEFAULT_USDJPY
+    jp_cash_jpy:      float = 0.0   # KabuBroker.get_wallet_margin()["MarginAccountWallet"]
+    usd_cash:         float = 0.0   # AlpacaBroker.get_account()["cash"]
+    us_equity_usd:    float = 0.0   # AlpacaBroker.get_account()["equity"]
+    usdjpy_rate:      float = _DEFAULT_USDJPY
+    usdjpy_source:    str   = ""    # "api" | "cache" | "fallback"
+    usdjpy_fetched_at: str  = ""    # "6/19" 形式
 
 
 class CXOAgent(BaseAgent):
@@ -365,6 +367,8 @@ print('決済完了: {symbol}')
             fx_signal=d["fx_label"],
             fx_rationale=d["fx_rationale"],
             usdjpy_rate=report_ctx.usdjpy_rate,
+            usdjpy_source=report_ctx.usdjpy_source,
+            usdjpy_fetched_at=report_ctx.usdjpy_fetched_at,
             margin_positions=[],
             sector_scores=d["sector_scores"],
             all_positions=d["us_holdings"],
@@ -425,6 +429,8 @@ print('決済完了: {symbol}')
             fx_signal=d["fx_label"],
             fx_rationale=d["fx_rationale"],
             usdjpy_rate=usdjpy,
+            usdjpy_source=report_ctx.usdjpy_source,
+            usdjpy_fetched_at=report_ctx.usdjpy_fetched_at,
             margin_positions=[],
             sector_scores=d["sector_scores"],
             all_positions=d["us_holdings"],

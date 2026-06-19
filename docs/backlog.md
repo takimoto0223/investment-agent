@@ -6,6 +6,10 @@
 - API確認: eスマートで円⇄ドル両替がAPIで可能か / 外貨決済(ドルで米株)の仕組みがあるか、
   Alpacaの日本からの入金・通貨扱い。FXRebalanceの両替設計に直結
 
+## マクロデータの実勢取得（積み残し）
+- USD/JPY: `data/fx_rate.py` (Frankfurter API) で実勢取得済み（2026-06-19〜）
+- VIX・米10Y: `main.py` の `_MACRO_DATA` 文字列で固定値（VIX=18.5, 米10Y=4.35%）のまま、実勢取得は未対応
+
 ## FXRebalance(両替役に徹する・確定方針)
 - レートAPI(Exchange Rate API / CurrencyFreaks 等、無料〜月数ドル)で高値掴み回避の見送りロジック
   (161円等の不利なレートでは両替を実行せず待つ。建玉の逆指値ではなく条件付き両替)
