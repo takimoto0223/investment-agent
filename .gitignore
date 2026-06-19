@@ -93,3 +93,9 @@ coverage.xml
 # Distribution
 *.tar.gz
 *.zip
+
+# Backtests (large data files / run artifacts)
+backtests/
+
+# Claude Code internal files
+.claude/
