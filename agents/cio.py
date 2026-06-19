@@ -221,25 +221,3 @@ class CIOAgent(BaseAgent):
             )
         )
         return allocs
-
-    def evaluate_portfolio_rotation(self, current_holdings: list[dict], ctx: MarketContext) -> str:
-        """
-        現在の保有銘柄とコンテキストを照らし合わせ、リバランス提案を自然言語で返す。
-        current_holdings: [{"symbol": "7203", "sector": "自動車", "weight": 0.15}, ...]
-        """
-        prompt = f"""
-## 現在のポートフォリオ
-{json.dumps(current_holdings, ensure_ascii=False, indent=2)}
-
-## 市場コンテキスト
-- セクタースコア: {json.dumps(ctx.sector_scores, ensure_ascii=False)}
-- ローテーションシグナル: {ctx.rotation_signal}
-- リスク水準: {ctx.risk_level}
-
-## リスク制約
-- 1銘柄の最大比率: {RISK.max_concentration_pct * 100:.0f}%
-
-上記を踏まえ、ポートフォリオのリバランス提案を箇条書きで3点以内で述べてください。
-具体的な銘柄コードか銘柄名を含めてください。
-"""
-        return self._ask_llm(prompt)
