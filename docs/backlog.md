@@ -26,7 +26,6 @@
 - 複数ポジション許可は第二段
 
 ## 掃除の積み残し(今回スコープ外)
-- verify_cxo_reports.py のキーワードチェックが any() で形骸化 → 意味あるチェックに直すか外す
 - レポート内容の非対称: ScalpDayは候補、MomentSwingは決定済み結果を表示している件の整理
 
 ## ツール導入の合図(覚えるため)
@@ -37,3 +36,4 @@
 - v6組織リファクタ①〜⑥、市場ガード、IntelScout収集スケジュール、命名一気通貫、デッドコード掃除
 - 命名積み残し(template.py等): DaytradeCandidate→ScalpDayCandidate / ValueDecision→SwingDecision 完了
 - MomentSwing_US: build_us_universe() に ret_5d_pct / ret_20d_pct 追加(プロンプト要求と実入力の整合修正) 完了
+- verify_cxo_reports.py: any() 形骸化チェックを廃止、カードタイトル+注入値の all() チェックに置換、サボタージュテスト追加 完了
