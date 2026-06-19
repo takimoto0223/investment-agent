@@ -161,10 +161,15 @@ def get_quote_us(symbol: str) -> dict:
 
 def build_us_universe(base_list: list[dict]) -> list[dict]:
     """
-    米国株ユニバースに volume_ratio・atr_pct・current_price を付加して返す。
-    DaytradeAgent.screen_candidates() に渡す形式に合わせる。
+    米国株ユニバースに volume_ratio・atr_pct・current_price・モメンタム指標を付加して返す。
+    MomentSwing_US の screen_value() に渡す形式に合わせる。
 
     base_list: [{"symbol": "NVDA", "name": "エヌビディア"}, ...]
+    追加フィールド:
+      ret_5d_pct  : 直近5営業日リターン（%）。MomentSwing の短期モメンタム判断用。
+      ret_20d_pct : 直近20営業日リターン（%）。中期トレンド方向の確認用。
+                    プロンプトで「5〜20日モメンタム」を要求しているが従来は入力になかった
+                    ため、プロンプト要求と実入力の不整合を解消するために追加。
     """
     result = []
     for item in base_list:
@@ -178,12 +183,19 @@ def build_us_universe(base_list: list[dict]) -> list[dict]:
             prev_close = daily[-1]["close"] if len(daily) >= 1 else current
             price_change_pct = round((current - prev_close) / prev_close, 4) if prev_close > 0 else 0.0
 
+            closes = [b["close"] for b in daily]
+            n = len(closes)
+            ret_5d_pct  = round((closes[-1] / closes[-6]  - 1) * 100, 2) if n >= 6  else None
+            ret_20d_pct = round((closes[-1] / closes[-21] - 1) * 100, 2) if n >= 21 else None
+
             entry = {
                 **item,
                 "volume_ratio":     calc_volume_ratio(daily, today_vol),
                 "atr_pct":          calc_atr_pct(daily),
                 "current_price":    current,
                 "price_change_pct": price_change_pct,
+                "ret_5d_pct":       ret_5d_pct,
+                "ret_20d_pct":      ret_20d_pct,
             }
             result.append(entry)
             logger.info(
@@ -191,9 +203,15 @@ def build_us_universe(base_list: list[dict]) -> list[dict]:
                 f"${entry['current_price']:.2f} "
                 f"volume_ratio={entry['volume_ratio']} "
                 f"atr_pct={entry['atr_pct']}% "
-                f"price_change={price_change_pct:+.2%}"
+                f"price_change={price_change_pct:+.2%} "
+                f"ret_5d={ret_5d_pct}% ret_20d={ret_20d_pct}%"
             )
         except Exception as e:
             logger.warning(f"米国株ユニバース構築失敗 {sym}: {e}")
-            result.append({**item, "volume_ratio": 0.0, "atr_pct": 0.0, "current_price": 0.0, "price_change_pct": 0.0})
+            result.append({
+                **item,
+                "volume_ratio": 0.0, "atr_pct": 0.0,
+                "current_price": 0.0, "price_change_pct": 0.0,
+                "ret_5d_pct": None, "ret_20d_pct": None,
+            })
     return result
