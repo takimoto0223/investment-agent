@@ -1434,7 +1434,7 @@ def run_morning_report() -> str:
     from agents.cxo import CXOAgent, CXOReportContext
     from agents.scalp_day import ScalpDay_JP
     from brokers.alpaca import AlpacaBroker, calc_daytrade_pl
-    from report.template import DaytradeCandidate
+    from report.template import ScalpDayCandidate
 
     logger.info(f"=== 朝次レポート生成開始 {datetime.now().strftime('%Y-%m-%d %H:%M')} ===")
 
@@ -1452,7 +1452,7 @@ def run_morning_report() -> str:
         logger.warning(f"デイトレ損益計算失敗: {exc}")
 
     # ScalpDay_JP 候補スクリーニング
-    daytrade_candidates: list[DaytradeCandidate] = []
+    scalpday_candidates: list[ScalpDayCandidate] = []
     try:
         from agents.cio import CIOAgent
         cio    = CIOAgent()
@@ -1462,7 +1462,7 @@ def run_morning_report() -> str:
         raw_cands = ScalpDay_JP().screen_candidates(universe, ctx)
         for sym in raw_cands[:5]:
             sym_name = next((u["name"] for u in universe if u["symbol"] == sym), sym)
-            daytrade_candidates.append(DaytradeCandidate(
+            scalpday_candidates.append(ScalpDayCandidate(
                 symbol=sym, name=sym_name, signal="buy", rationale="スクリーニング通過",
             ))
     except Exception as exc:
@@ -1477,7 +1477,7 @@ def run_morning_report() -> str:
         CXOAgent().generate_morning_report(
             report_ctx,
             daytrade_pl=daytrade_pl,
-            daytrade_candidates=daytrade_candidates,
+            scalpday_candidates=scalpday_candidates,
         )
     except Exception as exc:
         logger.error(f"朝次HTMLレポート送信失敗: {exc}", exc_info=True)

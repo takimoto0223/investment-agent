@@ -5,9 +5,9 @@ PR⑥ CXOAgent リファクタリングのテスト。
 確認事項:
   1. _build_report_data() がデータを正しく整形・変換する
   2. generate_evening_report() が send_report を呼ぶ
-  3. generate_morning_report() が daytrade_pl / daytrade_candidates を組み込む
-  4. daytrade_pl=None / daytrade_candidates=None でも安全に動く
-  5. _load_session_logs() が読んでいるのは us_value_log / us_daytrade_log のみ
+  3. generate_morning_report() が daytrade_pl / scalpday_candidates を組み込む
+  4. daytrade_pl=None / scalpday_candidates=None でも安全に動く
+  5. _load_session_logs() が読んでいるのは moment_swing_us_log / scalpday_us_log のみ
 """
 import unittest
 from unittest.mock import MagicMock, patch, PropertyMock
@@ -15,7 +15,7 @@ from datetime import date
 
 from agents.base import MarketContext
 from agents.cxo import CXOAgent, CXOReportContext, _normalize_fx_signal
-from report.template import DaytradeCandidate, DaytradeRecord
+from report.template import ScalpDayCandidate, DaytradeRecord
 
 
 # ──────────────────────────────────────────────────
@@ -231,12 +231,12 @@ class TestGenerateMorningReport(unittest.TestCase):
             return "<html></html>"
 
         mock_html.side_effect = capture
-        candidates = [DaytradeCandidate("9984", "ソフトバンクG", "buy", "スクリーニング通過")]
+        candidates = [ScalpDayCandidate("9984", "ソフトバンクG", "buy", "スクリーニング通過")]
         self.cxo.generate_morning_report(
-            self.report_ctx, daytrade_candidates=candidates
+            self.report_ctx, scalpday_candidates=candidates
         )
-        self.assertEqual(len(captured["data"].daytrade_candidates), 1)
-        self.assertEqual(captured["data"].daytrade_candidates[0].symbol, "9984")
+        self.assertEqual(len(captured["data"].scalpday_candidates), 1)
+        self.assertEqual(captured["data"].scalpday_candidates[0].symbol, "9984")
 
     @patch("agents.cxo.send_report", return_value=True)
     @patch("agents.cxo.build_morning_html")
@@ -256,8 +256,8 @@ class TestGenerateMorningReport(unittest.TestCase):
             return "<html></html>"
 
         mock_html.side_effect = capture
-        self.cxo.generate_morning_report(self.report_ctx, daytrade_candidates=None)
-        self.assertEqual(captured["data"].daytrade_candidates, [])
+        self.cxo.generate_morning_report(self.report_ctx, scalpday_candidates=None)
+        self.assertEqual(captured["data"].scalpday_candidates, [])
 
     @patch("agents.cxo.send_report", return_value=True)
     @patch("agents.cxo.build_morning_html")
@@ -318,9 +318,9 @@ class TestLoadSessionLogs(unittest.TestCase):
             "scalpday_us_log": [],
         }
         extras = cxo._build_morning_extras(logs, None, None, 155.0)
-        self.assertEqual(len(extras["value_decisions"]), 1)
-        self.assertEqual(extras["value_decisions"][0].symbol, "NVDA")
-        self.assertEqual(extras["value_decisions"][0].action, "buy")
+        self.assertEqual(len(extras["swing_decisions"]), 1)
+        self.assertEqual(extras["swing_decisions"][0].symbol, "NVDA")
+        self.assertEqual(extras["swing_decisions"][0].action, "buy")
 
 
 # ──────────────────────────────────────────────────

@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 
 from agents.base import MarketContext
 from agents.cxo import CXOAgent, CXOReportContext
-from report.template import DaytradeCandidate, DaytradeRecord
+from report.template import ScalpDayCandidate, DaytradeRecord
 
 _CTX = MarketContext(
     date=date.today().isoformat(),
@@ -75,9 +75,9 @@ _DAYTRADE_PL = {
 }
 
 _CANDIDATES = [
-    DaytradeCandidate("6857", "アドバンテスト", "buy",  "出来高急増・AI半導体セクター優位"),
-    DaytradeCandidate("9984", "ソフトバンクG",  "buy",  "DCインフラ連動・モメンタム継続"),
-    DaytradeCandidate("4063", "信越化学",        "sell", "ATR拡大・利確水準接近"),
+    ScalpDayCandidate("6857", "アドバンテスト", "buy",  "出来高急増・AI半導体セクター優位"),
+    ScalpDayCandidate("9984", "ソフトバンクG",  "buy",  "DCインフラ連動・モメンタム継続"),
+    ScalpDayCandidate("4063", "信越化学",        "sell", "ATR拡大・利確水準接近"),
 ]
 
 # ── HTML 保存先 ───────────────────────────────────────────────────────
@@ -185,7 +185,7 @@ def main():
         ok = CXOAgent().generate_morning_report(
             _REPORT_CTX,
             daytrade_pl=_DAYTRADE_PL,
-            daytrade_candidates=_CANDIDATES,
+            scalpday_candidates=_CANDIDATES,
         )
 
     print(f"  送信結果: {'OK' if ok else 'NG'}")

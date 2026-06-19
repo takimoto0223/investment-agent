@@ -60,8 +60,8 @@ class SectorScore:
 
 
 @dataclass
-class DaytradeCandidate:
-    """デイトレ候補銘柄1件。"""
+class ScalpDayCandidate:
+    """ScalpDay スクリーニング通過候補（Critic 審査前。signal=buy|sell はシグナル方向のみ）。"""
     symbol: str
     name: str
     signal: str             # "buy" | "sell"
@@ -82,8 +82,8 @@ class DaytradeRecord:
 
 
 @dataclass
-class ValueDecision:
-    """バリュー投資の買い/見送り決定1件。"""
+class SwingDecision:
+    """MomentSwing Critic 審査後の買い/見送り決定（action=buy|reject、qty・consensus を持つ）。"""
     symbol: str
     name: str
     action: str             # "buy" | "reject"
@@ -125,7 +125,7 @@ class MorningReportData(EveningReportData):
     us_realized_pl_usd: float = 0.0     # 米国株昨夜確定損益（USD）
     us_realized_pl_jpy: float = 0.0     # 米国株昨夜確定損益（JPY換算）
     us_trade_count: int = 0
-    daytrade_candidates: list = field(default_factory=list)  # list[DaytradeCandidate]
+    scalpday_candidates: list = field(default_factory=list)  # list[ScalpDayCandidate]
     overnight_fx_summary: str = ""
     overnight_fx_high: float = 0.0
     overnight_fx_low: float = 0.0
@@ -136,7 +136,7 @@ class MorningReportData(EveningReportData):
     daytrade_fees: float = 0.0          # 手数料合計 (USD)
     daytrade_net_pl: float = 0.0        # ネット損益 (USD)
     # バリュー投資決定
-    value_decisions: list = field(default_factory=list)      # list[ValueDecision]
+    swing_decisions: list = field(default_factory=list)       # list[SwingDecision]
 
 
 # ── ドーナツチャート（PNG base64、メールクライアント互換）──────────
@@ -393,7 +393,7 @@ def _margin_table(positions: list) -> str:
 
 # ── デイトレ候補テーブル ──────────────────────────────────────
 
-def _daytrade_table(candidates: list) -> str:
+def _scalpday_candidate_table(candidates: list) -> str:
     if not candidates:
         return '<p style="color:#9ca3af;font-size:13px;margin:0;">候補なし</p>'
     rows = []
@@ -675,7 +675,7 @@ def _build_morning_rows(data: MorningReportData) -> list:
     )))
 
     # 日本株 本日デイトレ候補
-    rows.append(_card("本日デイトレ候補（日本株）", _daytrade_table(data.daytrade_candidates)))
+    rows.append(_card("本日デイトレ候補（日本株）", _scalpday_candidate_table(data.scalpday_candidates)))
 
     # 夜間の為替変動サマリー
     fx_c  = "#16a34a" if data.overnight_fx_change_pct >= 0 else "#dc2626"
@@ -698,10 +698,10 @@ def _build_morning_rows(data: MorningReportData) -> list:
         f'{data.overnight_fx_summary}</div>'
     )))
 
-    # バリュー投資 昨日の決定サマリー
-    if data.value_decisions:
+    # MomentSwing 昨日の買い/見送り決定サマリー
+    if data.swing_decisions:
         val_rows_html = ""
-        for v in data.value_decisions:
+        for v in data.swing_decisions:
             if v.action == "buy":
                 badge_c, badge_t = "#16a34a", "買付"
             else:
