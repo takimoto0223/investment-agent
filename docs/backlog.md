@@ -31,4 +31,5 @@
 
 ## 完了済み(参考)
 - v6組織リファクタ①〜⑥、市場ガード、IntelScout収集スケジュール、命名一気通貫、デッドコード掃除
-- 命名積み残し(template.py等): DaytradeCandidate→ScalpDayCandidate / ValueDecision→SwingDecision ステップ3で完了
+- 命名積み残し(template.py等): DaytradeCandidate→ScalpDayCandidate / ValueDecision→SwingDecision 完了
+- MomentSwing_US: build_us_universe() に ret_5d_pct / ret_20d_pct 追加(プロンプト要求と実入力の整合修正) 完了
