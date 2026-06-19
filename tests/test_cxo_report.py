@@ -261,21 +261,6 @@ class TestGenerateMorningReport(unittest.TestCase):
 
     @patch("agents.cxo.send_report", return_value=True)
     @patch("agents.cxo.build_morning_html")
-    def test_discussion_items_always_empty(self, mock_html, mock_send):
-        """discussion_log は廃止済みのため常に空リスト。"""
-        captured = {}
-
-        def capture(data):
-            captured["data"] = data
-            return "<html></html>"
-
-        mock_html.side_effect = capture
-        self.cxo.generate_morning_report(self.report_ctx)
-        self.assertEqual(captured["data"].discussion_items, [])
-        self.assertEqual(captured["data"].discussion_session_date, "")
-
-    @patch("agents.cxo.send_report", return_value=True)
-    @patch("agents.cxo.build_morning_html")
     def test_subject_contains_morning(self, mock_html, mock_send):
         mock_html.return_value = "<html></html>"
         self.cxo.generate_morning_report(self.report_ctx)
@@ -295,23 +280,6 @@ class TestLoadSessionLogs(unittest.TestCase):
             logs = cxo._load_session_logs()
         self.assertIn("moment_swing_us_log", logs)
         self.assertIn("scalpday_us_log", logs)
-
-    def test_does_not_read_discussion_log(self):
-        """discussion_log.json は廃止済みのため読まない。"""
-        cxo = _make_cxo()
-        read_paths = []
-
-        def capture_read(path):
-            read_paths.append(str(path))
-            return []
-
-        with patch.object(CXOAgent, "_read_json_log", side_effect=capture_read):
-            cxo._load_session_logs()
-
-        self.assertFalse(
-            any("discussion" in p for p in read_paths),
-            f"discussion_log が読まれている: {read_paths}",
-        )
 
     def test_reads_moment_swing_us_log(self):
         cxo = _make_cxo()

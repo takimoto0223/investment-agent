@@ -749,32 +749,6 @@ supply_chain_position:
             "digest_text":       data.get("digest_text", ""),
         }
 
-    def evaluate(self, signal: dict, ctx: MarketContext) -> dict:
-        """議論オーケストレーター用：シグナルのセクター波及を評価する。"""
-        prompt = f"""
-## 評価対象シグナル
-{json.dumps(signal, ensure_ascii=False, indent=2)}
-
-## 現在の市場コンテキスト
-- リスク水準: {ctx.risk_level}
-- セクタースコア: {json.dumps(ctx.sector_scores, ensure_ascii=False)}
-
-このシグナルについて、セクタースコアへの影響とサプライチェーン波及を評価し、
-JSON で返してください。
-
-{{
-  "opinion": "賛成 | 反対 | 保留",
-  "rationale": "根拠 100 文字以内",
-  "suggested_action": "具体的な提案"
-}}
-"""
-        data = self._ask_llm_json(prompt)
-        return {
-            "agent":            self.name,
-            "opinion":          data.get("opinion", "保留"),
-            "rationale":        data.get("rationale", ""),
-            "suggested_action": data.get("suggested_action", ""),
-        }
 
 
 # ── SEC EDGAR 銘柄→CIK マッピング ─────────────────────────────

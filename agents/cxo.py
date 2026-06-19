@@ -21,7 +21,7 @@ from prompts.all_agents import CXO_PROMPT
 from report.template import (
     EveningReportData, MorningReportData,
     HoldingItem, MarginPosition, SectorScore,
-    DaytradeCandidate, DiscussionItem,
+    DaytradeCandidate,
     ValueDecision,
     build_evening_html, build_morning_html,
 )
@@ -441,8 +441,6 @@ print('決済完了: {symbol}')
             overnight_fx_high=usdjpy * 1.005,
             overnight_fx_low=usdjpy * 0.995,
             overnight_fx_change_pct=0.0,
-            discussion_items=[],        # discussion_log は廃止済みのため空
-            discussion_session_date="",
             daytrade_records=extras["daytrade_records"],
             daytrade_gross_pl=extras["daytrade_gross_pl"],
             daytrade_fees=extras["daytrade_fees"],

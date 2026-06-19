@@ -69,15 +69,6 @@ class DaytradeCandidate:
 
 
 @dataclass
-class DiscussionItem:
-    """議論結果1件。"""
-    verdict: str            # "execute" | "defer" | "reject"
-    score: float
-    title: str
-    summary: str = ""
-
-
-@dataclass
 class DaytradeRecord:
     """デイトレ1件の損益。"""
     symbol: str
@@ -139,8 +130,6 @@ class MorningReportData(EveningReportData):
     overnight_fx_high: float = 0.0
     overnight_fx_low: float = 0.0
     overnight_fx_change_pct: float = 0.0
-    discussion_items: list = field(default_factory=list)     # list[DiscussionItem]
-    discussion_session_date: str = ""
     # デイトレ損益詳細
     daytrade_records: list = field(default_factory=list)     # list[DaytradeRecord]
     daytrade_gross_pl: float = 0.0      # グロス損益 (USD)
@@ -433,45 +422,6 @@ def _daytrade_table(candidates: list) -> str:
         f'<th style="padding:5px 8px;font-size:11px;color:#6b7280;font-weight:normal;">シグナル</th>'
         f'<th style="padding:5px 0;font-size:11px;color:#6b7280;'
         f'text-align:left;font-weight:normal;">根拠</th>'
-        f'</tr>'
-        + "".join(rows)
-        + "</table>"
-    )
-
-
-# ── 議論サマリーセクション ──────────────────────────────────────
-
-def _discussion_section(items: list, session_date: str) -> str:
-    if not items:
-        return '<p style="color:#9ca3af;font-size:13px;margin:0;">議論ログなし</p>'
-    verdict_styles = {
-        "execute": ("#16a34a", "white", "実行"),
-        "defer":   ("#d97706", "white", "保留"),
-        "reject":  ("#dc2626", "white", "却下"),
-    }
-    rows = []
-    for item in items:
-        bg, fg, label = verdict_styles.get(item.verdict, ("#6b7280", "white", item.verdict))
-        rows.append(
-            f'<tr style="border-bottom:1px solid #f3f4f6;">'
-            f'<td style="padding:7px 8px 7px 0;white-space:nowrap;">'
-            f'<span style="background:{bg};color:{fg};padding:2px 8px;'
-            f'border-radius:3px;font-size:11px;">{label}</span></td>'
-            f'<td style="padding:7px 8px;font-size:11px;color:#6b7280;'
-            f'white-space:nowrap;">{item.score:.2f}</td>'
-            f'<td style="padding:7px 0;font-size:12px;color:#374151;">{item.title}</td>'
-            f'</tr>'
-        )
-    date_label = f"（{session_date}）" if session_date else ""
-    return (
-        f'<div style="font-size:11px;color:#9ca3af;margin-bottom:8px;">'
-        f'最新セッション{date_label}</div>'
-        f'<table cellpadding="0" cellspacing="0" width="100%">'
-        f'<tr style="background:#f9fafb;">'
-        f'<th style="padding:5px 8px 5px 0;font-size:11px;color:#6b7280;font-weight:normal;">判定</th>'
-        f'<th style="padding:5px 8px;font-size:11px;color:#6b7280;font-weight:normal;">スコア</th>'
-        f'<th style="padding:5px 0;font-size:11px;color:#6b7280;'
-        f'text-align:left;font-weight:normal;">タイトル</th>'
         f'</tr>'
         + "".join(rows)
         + "</table>"
@@ -772,11 +722,6 @@ def _build_morning_rows(data: MorningReportData) -> list:
             f'<table cellpadding="0" cellspacing="0" width="100%">{val_rows_html}</table>'
         )))
 
-    # インテリジェンスエージェントの議論サマリー
-    rows.append(_card(
-        "インテリジェンス議論サマリー",
-        _discussion_section(data.discussion_items, data.discussion_session_date),
-    ))
 
     return rows
 
