@@ -52,12 +52,14 @@ _ES_SYSTEM_REQUIRED = 0x00000001
 
 def _prevent_sleep():
     """長時間セッション中にWindowsのスリープを防ぐ（S3スリープ対策）。"""
-    ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED)
+    if hasattr(ctypes, 'windll'):
+        ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED)
     logging.getLogger("main").info("スリープ防止: 有効")
 
 def _allow_sleep():
     """スリープ防止を解除する（セッション終了時に呼ぶ）。"""
-    ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
+    if hasattr(ctypes, 'windll'):
+        ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
     logging.getLogger("main").info("スリープ防止: 解除")
 
 
