@@ -153,14 +153,8 @@ class CXOAgent(BaseAgent):
             except Exception:
                 continue
 
-        # ブローカー未接続時はダミーデータで円グラフを描画
+        # JP建玉は kabu API 未接続中は固定ダミー。US建玉が空なら空のまま渡す（テンプレート側で「保有なし」を表示）
         jp_holdings: list[HoldingItem] = _DUMMY_JP
-        if not us_holdings:
-            us_holdings = [
-                HoldingItem(symbol="NVDA", name="NVIDIA",     value_jpy=580_000, pf_pct=0.0, change_pct=+3.2),
-                HoldingItem(symbol="MSFT", name="Microsoft",  value_jpy=430_000, pf_pct=0.0, change_pct=+0.7),
-                HoldingItem(symbol="AAPL", name="Apple",      value_jpy=310_000, pf_pct=0.0, change_pct=-0.4),
-            ]
 
         # 総資産・PF比計算
         usd_equity_jpy = report_ctx.us_equity_usd * usdjpy

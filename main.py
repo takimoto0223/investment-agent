@@ -1469,7 +1469,7 @@ def run_morning_report() -> str:
     try:
         from agents.cio import CIOAgent
         cio    = CIOAgent()
-        allocs = cio.allocate_budgets(ctx, total_cash_jpy=jp_cash_jpy or 500_000, cash_usd=0)
+        allocs = cio.allocate_budgets(ctx, total_cash_jpy=jp_cash_jpy or 500_000, cash_usd=0, usd_jpy_rate=usdjpy_rate)
         alloc  = allocs["ScalpDay_JP"]
         universe = build_pod_universe("JP", alloc.active_sectors, alloc.catalyst_slots)
         raw_cands = ScalpDay_JP().screen_candidates(universe, ctx)

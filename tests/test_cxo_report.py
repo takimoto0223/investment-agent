@@ -126,11 +126,20 @@ class TestBuildReportData(unittest.TestCase):
         total_pf = sum(h.pf_pct for h in d["us_holdings"] + d["jp_holdings"])
         self.assertGreater(total_pf, 0)
 
-    def test_empty_positions_uses_dummy(self):
+    def test_empty_positions_yields_empty_us_holdings(self):
+        """us_positions=[] のとき us_holdings は空リストになる（ダミー補完なし）。"""
         ctx = _make_report_ctx(us_positions=[])
         d = self.cxo._build_report_data(ctx)
-        # ダミーUSホールディングが入る
-        self.assertGreater(len(d["us_holdings"]), 0)
+        self.assertEqual(d["us_holdings"], [])
+
+    def test_empty_positions_no_dummy_symbols(self):
+        """us_positions=[] のとき NVDA/MSFT/AAPL の固定ダミーが混入しない（回帰防止）。"""
+        ctx = _make_report_ctx(us_positions=[])
+        d = self.cxo._build_report_data(ctx)
+        symbols = {h.symbol for h in d["us_holdings"]}
+        self.assertNotIn("NVDA", symbols)
+        self.assertNotIn("MSFT", symbols)
+        self.assertNotIn("AAPL", symbols)
 
     def test_cxo_memo_generated(self):
         d = self.cxo._build_report_data(self.report_ctx)
@@ -324,7 +333,80 @@ class TestLoadSessionLogs(unittest.TestCase):
 
 
 # ──────────────────────────────────────────────────
-# 6. CXOReportContext: データクラス構造
+# 6. US建玉ゼロ時のHTML表示（回帰防止）
+# ──────────────────────────────────────────────────
+
+class TestUsHoldingsEmptyHtml(unittest.TestCase):
+    """
+    us_positions=[] のとき:
+      - HTML に「保有なし」が出る
+      - ダミー銘柄 NVDA/MSFT/AAPL が HTML に出ない
+    このクラスは build_evening_html を実際に呼ぶ（matplotlib 使用）。
+    """
+
+    def _build_html(self, us_positions: list) -> str:
+        from unittest.mock import patch as p
+        from agents.cxo import CXOAgent, CXOReportContext
+        from report.template import build_evening_html
+
+        cxo = _make_cxo()
+        ctx = _make_report_ctx(us_positions=us_positions, us_equity_usd=0.0)
+        with p("agents.cxo.send_report", return_value=True) as mock_send:
+            d = cxo._build_report_data(ctx)
+
+        from report.template import EveningReportData, SectorScore
+        from datetime import datetime
+        data = EveningReportData(
+            generated_at=datetime.now(),
+            total_assets_jpy=d["total_jpy"],
+            total_assets_change_pct=0.0,
+            jp_holdings=d["jp_holdings"],
+            us_holdings=d["us_holdings"],
+            risk_score=d["risk_score"],
+            risk_level=ctx.ctx.risk_level,
+            jpy_asset_ratio=d["jpy_asset_ratio"],
+            usd_asset_ratio=d["usd_asset_ratio"],
+            jpy_cash_ratio=d["jpy_cash_ratio"],
+            usd_cash_ratio=d["usd_cash_ratio"],
+            fx_signal=d["fx_label"],
+            fx_rationale=d["fx_rationale"],
+            usdjpy_rate=ctx.usdjpy_rate,
+            margin_positions=[],
+            sector_scores=d["sector_scores"],
+            all_positions=d["us_holdings"],
+            pre_us_fx_signal=d["fx_label"],
+            pre_us_fx_rationale=d["fx_rationale"],
+            cxo_memo=d["cxo_memo"],
+            macro_notes=ctx.ctx.macro_notes,
+            rotation_signal=ctx.ctx.rotation_signal,
+        )
+        return build_evening_html(data)
+
+    def test_empty_us_shows_hohon_nashi(self):
+        """保有ゼロのとき HTML に「保有なし」が含まれる。"""
+        html = self._build_html(us_positions=[])
+        self.assertIn("保有なし", html)
+
+    def test_empty_us_no_dummy_nvda_in_html(self):
+        """保有ゼロのとき HTML に NVDA ダミー行が出ない（回帰防止）。"""
+        html = self._build_html(us_positions=[])
+        # 凡例行として "NVDA" が出ないことを確認
+        # ※ テスト用 MarketContext は "NVDA" を含まないので、グラフ系からも出ない
+        self.assertNotIn("NVDA", html)
+
+    def test_with_us_positions_no_hohon_nashi(self):
+        """保有ありのとき「保有なし」は出ない。"""
+        positions = [
+            {"symbol": "NVDA", "qty": "1", "avg_entry_price": "800.0",
+             "current_price": "840.0", "market_value": "840.0"},
+        ]
+        html = self._build_html(us_positions=positions)
+        self.assertNotIn("保有なし", html)
+        self.assertIn("NVDA", html)
+
+
+# ──────────────────────────────────────────────────
+# 8. CXOReportContext: データクラス構造
 # ──────────────────────────────────────────────────
 
 class TestCXOReportContext(unittest.TestCase):

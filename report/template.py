@@ -137,7 +137,7 @@ class MorningReportData(EveningReportData):
     daytrade_gross_pl: float = 0.0      # グロス損益 (USD)
     daytrade_fees: float = 0.0          # 手数料合計 (USD)
     daytrade_net_pl: float = 0.0        # ネット損益 (USD)
-    # バリュー投資決定
+    # スイング決定
     swing_decisions: list = field(default_factory=list)       # list[SwingDecision]
 
 
@@ -563,7 +563,11 @@ def _build_base_rows(data: EveningReportData) -> list:
             f'<span style="color:{ch_c};">({s}{h.change_pct:.1f}%)</span></td></tr>'
         )
     jp_leg = f'<table cellpadding="0" cellspacing="0">{"".join(jp_legend_rows)}</table>'
-    us_leg = f'<table cellpadding="0" cellspacing="0">{"".join(us_legend_rows)}</table>'
+    us_leg = (
+        f'<table cellpadding="0" cellspacing="0">{"".join(us_legend_rows)}</table>'
+        if us_legend_rows
+        else '<div style="color:#9ca3af;font-size:11px;text-align:center;margin-top:8px;">保有なし</div>'
+    )
 
     rows.append(_card("保有銘柄（円グラフ）", (
         f'<table cellpadding="0" cellspacing="0" width="100%"><tr>'
@@ -740,7 +744,7 @@ def _build_morning_rows(data: MorningReportData) -> list:
                 f'{v.rationale}</td>'
                 f'</tr>'
             )
-        rows.append(_card("バリュー投資 昨日の売買判断", (
+        rows.append(_card("スイング 昨日の売買判断", (
             f'<table cellpadding="0" cellspacing="0" width="100%">{val_rows_html}</table>'
         )))
 
