@@ -7,7 +7,6 @@
   Alpacaの日本からの入金・通貨扱い。FXRebalanceの両替設計に直結
 
 ## マクロデータの実勢取得（積み残し）
-- USD/JPY: `data/fx_rate.py` (Frankfurter API) で実勢取得済み（2026-06-19〜）
 - VIX・米10Y: `main.py` の `_MACRO_DATA` 文字列で固定値（VIX=18.5, 米10Y=4.35%）のまま、実勢取得は未対応
 
 ## FXRebalance(両替役に徹する・確定方針)
@@ -37,3 +36,6 @@
 - 命名積み残し(template.py等): DaytradeCandidate→ScalpDayCandidate / ValueDecision→SwingDecision 完了
 - MomentSwing_US: build_us_universe() に ret_5d_pct / ret_20d_pct 追加(プロンプト要求と実入力の整合修正) 完了
 - verify_cxo_reports.py: any() 形骸化チェックを廃止、カードタイトル+注入値の all() チェックに置換、サボタージュテスト追加 完了
+- USD/JPY実勢レート取得: data/fx_rate.py 新設(Frankfurter API・4秒TO・24hキャッシュ・fallback表示)、
+  Frankfurter 403(User-Agentブロック)修正、UA検証テスト追加、IntelScoutでキャッシュ温め追加、
+  レポート表示・allocate_budgets・Critic大口判定すべてが実勢レートを使うように 完了（2026-06-20）
