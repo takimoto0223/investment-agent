@@ -83,8 +83,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-# マクロデータ（本番は外部APIから取得予定）
-_MACRO_DATA = "USD/JPY=155.2, VIX=18.5, 米10Y=4.35%"
+def _build_macro_data(usdjpy_rate: float | None = None) -> str:
+    """
+    USD/JPY(Frankfurter) + VIX・米10Y(FRED) の実勢値をマクロ文字列に組み立てる。
+    usdjpy_rate を渡すと get_usd_jpy() の二重呼び出しを避けられる(レポートフロー用)。
+    各値は 24h キャッシュ → fallback の順で取得するため失敗しても文字列は必ず返る。
+    """
+    from data.fx_rate import get_usd_jpy
+    from data.macro_rates import get_vix, get_us_10y
+    if usdjpy_rate is None:
+        usdjpy_rate, _, _ = get_usd_jpy()
+    vix,   vix_at,  vix_src  = get_vix()
+    us10y, t10y_at, t10y_src = get_us_10y()
+    vix_sfx  = "暫定値" if vix_src  == "fallback" else f"{vix_at}時点"
+    t10y_sfx = "暫定値" if t10y_src == "fallback" else f"{t10y_at}時点"
+    return (
+        f"USD/JPY={usdjpy_rate:.2f}, "
+        f"VIX={vix:.2f} ({vix_sfx}), "
+        f"米10Y={us10y:.2f}% ({t10y_sfx})"
+    )
 
 
 # ──────────────────────────────────────────────────
@@ -151,7 +168,7 @@ def run_scalpday_jp_session(paper: bool = True):
     _news, _obs = get_news_summary_for_cio()
     ctx = cio.generate_market_context(
         news_summary=_news,
-        macro_data=_MACRO_DATA,
+        macro_data=_build_macro_data(),
         obs_source=_obs,
     )
     logger.info(f"コンテキスト: risk={ctx.risk_level}, rotation={ctx.rotation_signal}")
@@ -339,16 +356,17 @@ def run_moment_swing_jp_session(paper: bool = True):
     # MarketContext（CIOキャッシュがあれば再利用）
     cio = CIOAgent()
     _news, _obs = get_news_summary_for_cio()
+    _macro = _build_macro_data()
     ctx = cio.generate_market_context(
         news_summary=_news,
-        macro_data=_MACRO_DATA,
+        macro_data=_macro,
         obs_source=_obs,
     )
     logger.info(f"コンテキスト: risk={ctx.risk_level}, rotation={ctx.rotation_signal}")
 
     # FXシグナル（allocate_budgets の usd_jpy_rate に必要）
     fx_agent = FXStrategyAgent()
-    fx_signal = fx_agent.generate_signal(_MACRO_DATA, 0.35, ctx)
+    fx_signal = fx_agent.generate_signal(_macro, 0.35, ctx)
     usd_jpy_rate = float(fx_signal.get("usd_jpy_rate", 155.0))
 
     # CIO 配分ゲート
@@ -541,16 +559,17 @@ def run_moment_swing_us_session():
     # MarketContext
     cio = CIOAgent()
     _news, _obs = get_news_summary_for_cio()
+    _macro = _build_macro_data()
     ctx = cio.generate_market_context(
         news_summary=_news,
-        macro_data=_MACRO_DATA,
+        macro_data=_macro,
         obs_source=_obs,
     )
     logger.info(f"コンテキスト: risk={ctx.risk_level}, rotation={ctx.rotation_signal}")
 
     # FXシグナル（配分ゲートで usd_jpy_rate を使うため先に取得）
     fx_agent = FXStrategyAgent()
-    fx_signal = fx_agent.generate_signal(_MACRO_DATA, 0.35, ctx)
+    fx_signal = fx_agent.generate_signal(_macro, 0.35, ctx)
     usd_jpy_rate = float(fx_signal.get("usd_jpy_rate", 155.0))
 
     # 配分ゲート（usd_jpy_rate は FXStrategyAgent 由来）
@@ -879,16 +898,17 @@ def run_scalpday_us_session(duration_minutes: int | None = None):
     # 2. MarketContext 生成
     logger.info("CIO: マーケットコンテキスト生成中...")
     _news, _obs = get_news_summary_for_cio()
+    _macro = _build_macro_data()
     ctx = cio.generate_market_context(
         news_summary=_news,
-        macro_data=_MACRO_DATA,
+        macro_data=_macro,
         obs_source=_obs,
     )
     logger.info(f"コンテキスト: risk={ctx.risk_level}, rotation={ctx.rotation_signal}")
 
     # 3. FX シグナル（配分ゲートで usd_jpy_rate を使うため先に取得）
     logger.info("FX戦略シグナル取得中...")
-    fx_signal = fx_agent.generate_signal(_MACRO_DATA, 0.35, ctx)
+    fx_signal = fx_agent.generate_signal(_macro, 0.35, ctx)
     logger.info(
         f"FXシグナル: {fx_signal.get('fx_signal')} "
         f"us_weight_bias={fx_signal.get('us_weight_bias')}"
@@ -1209,19 +1229,20 @@ def run_fx_rebalance_session():
     fx_agent = FXStrategyAgent()
     critic   = FXRebalance_Critic()
 
-    # 1. MarketContext 生成（マクロデータは _MACRO_DATA のみ参照、収集はしない）
+    # 1. MarketContext 生成
     logger.info("CIO: マーケットコンテキスト生成中...")
     _news, _obs = get_news_summary_for_cio()
+    _macro = _build_macro_data()
     ctx = cio.generate_market_context(
         news_summary=_news,
-        macro_data=_MACRO_DATA,
+        macro_data=_macro,
         obs_source=_obs,
     )
     logger.info(f"コンテキスト: risk={ctx.risk_level}, rotation={ctx.rotation_signal}")
 
     # 2. FX シグナル生成
     logger.info("FXStrategyAgent: シグナル生成中...")
-    fx_signal = fx_agent.generate_signal(_MACRO_DATA, 0.35, ctx)
+    fx_signal = fx_agent.generate_signal(_macro, 0.35, ctx)
     logger.info(
         f"FXシグナル: {fx_signal.get('fx_signal')} "
         f"目標ドル比率={fx_signal.get('target_usd_ratio')}%"
@@ -1381,9 +1402,9 @@ def _collect_report_data() -> "tuple":
     from data.fx_rate import get_usd_jpy
     from datetime import date
 
-    # 実勢 USD/JPY レート取得（タイムアウト4秒 → キャッシュ → 暫定値155.0）
+    # 実勢レート取得（USD/JPY=Frankfurter当日値、VIX/10Y=FRED前営業日値）
     usdjpy_rate, usdjpy_fetched_at, usdjpy_source = get_usd_jpy()
-    macro_data = f"USD/JPY={usdjpy_rate:.2f}, VIX=18.5, 米10Y=4.35%"
+    macro_data = _build_macro_data(usdjpy_rate=usdjpy_rate)
 
     # MarketContext（CIO）
     ctx: MarketContext
