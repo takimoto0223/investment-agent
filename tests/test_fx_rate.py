@@ -1,15 +1,18 @@
 """
 tests/test_fx_rate.py
-data/fx_rate.get_usd_jpy() の4ケーステスト。
+data/fx_rate.get_usd_jpy() のテスト。
 
 ケース:
   1. API 成功 → rate / "6/19" 形式 / source="api" を返す
   2. API タイムアウト → キャッシュ有効 (24h以内) → source="cache"
   3. API タイムアウト → キャッシュ期限切れ (24h超) → source="fallback", rate=155.0
   4. API タイムアウト → キャッシュなし → source="fallback", rate=155.0
+  5. リクエストに User-Agent ヘッダが付いていること
+     （Frankfurter は urllib デフォルト UA を 403 で弾く。このテストで回帰を防ぐ）
 """
 import json
 import unittest
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
@@ -114,6 +117,31 @@ class TestGetUsdJpy(unittest.TestCase):
         self.assertEqual(source, "fallback")
         self.assertIsInstance(fetched_at, str)
         self.assertIn("/", fetched_at)  # "6/19" 形式であること
+
+    # ── ケース5: User-Agent ヘッダが Request に設定されていること ──────
+    # Frankfurterは urllib デフォルト UA (Python-urllib/*) を 403 で弾く。
+    # urlopen に渡すオブジェクトが Request であり、かつ Mozilla UA が付くことを確認。
+
+    def test_request_has_user_agent(self):
+        sent_requests = []
+
+        def fake_urlopen(req, timeout=None):
+            sent_requests.append(req)
+            return _make_urlopen_response(_API_RESPONSE)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            self.m.get_usd_jpy()
+
+        self.assertEqual(len(sent_requests), 1, "urlopen が1回呼ばれること")
+        req = sent_requests[0]
+        self.assertIsInstance(
+            req, urllib.request.Request,
+            "文字列ではなく Request オブジェクトが渡されること",
+        )
+        # urllib.request.Request は get_header() でキーをタイトルケースで管理する
+        ua = req.get_header("User-agent")
+        self.assertIsNotNone(ua, "User-Agent ヘッダが設定されていること")
+        self.assertIn("Mozilla", ua, "User-Agent に 'Mozilla' が含まれること")
 
 
 if __name__ == "__main__":

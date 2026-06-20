@@ -1354,6 +1354,11 @@ def run_intel_scout_session():
     save_state(state)
     logger.info(f"状態更新: last_collected_at = {now.isoformat()}")
 
+    # 9. USD/JPY キャッシュを更新（取引セッション前にレートを温めておく）
+    from data.fx_rate import get_usd_jpy
+    _fx_rate, _fx_at, _fx_src = get_usd_jpy()
+    logger.info("USD/JPY キャッシュ更新: %.2f (%s時点, source=%s)", _fx_rate, _fx_at, _fx_src)
+
     _allow_sleep()
     logger.info("=== IntelScout 収集セッション終了 ===")
 

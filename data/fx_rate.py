@@ -34,8 +34,13 @@ def get_usd_jpy() -> tuple[float, str, str]:
         - source     : str   — "api" | "cache" | "fallback"
     """
     # 1. Frankfurter API (4 秒タイムアウト)
+    # User-Agent 必須: Frankfurterは urllib デフォルト UA (Python-urllib/*) を 403 で弾く
     try:
-        with urllib.request.urlopen(_API_URL, timeout=_API_TIMEOUT) as resp:
+        req = urllib.request.Request(
+            _API_URL,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=_API_TIMEOUT) as resp:
             data = json.loads(resp.read().decode())
         rate     = float(data["rates"]["JPY"])
         date_str = data.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
