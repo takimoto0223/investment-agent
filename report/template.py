@@ -236,7 +236,7 @@ def _risk_meter(score: int) -> str:
     color = _RISK_COLORS[score]
     return (
         f'<table cellpadding="0" cellspacing="0" '
-        f'style="border-collapse:collapse;border-radius:4px;overflow:hidden;">'
+        f'style="border-collapse:collapse;">'
         f'<tr>{"".join(segs)}</tr></table>'
         f'<div style="font-size:12px;font-weight:bold;color:{color};margin-top:5px;">'
         f'レベル {score}/5 &nbsp;{label}</div>'
