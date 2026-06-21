@@ -119,6 +119,9 @@ class EveningReportData:
     cxo_memo: str = "通常運転。"
     macro_notes: str = ""
     rotation_signal: str = "維持"
+    # 米国株現在ポジション生データ（Alpaca get_positions() の戻り値）
+    # 朝次・夜間の両レポートで円グラフとマトリクスの単一ソースとして使う
+    us_positions_raw: list = field(default_factory=list)      # list[dict]
 
 
 @dataclass
@@ -141,9 +144,6 @@ class MorningReportData(EveningReportData):
     swing_decisions: list = field(default_factory=list)       # list[SwingDecision]
     # スイング決定（JP）kabu API 未接続中は常に空リスト
     swing_decisions_jp: list = field(default_factory=list)    # list[SwingDecision]
-    # 米国株現在ポジション生データ（Alpaca get_positions() の戻り値）
-    # unrealized_pl を 2×2 グリッドで直接表示するために保持する
-    us_positions_raw: list = field(default_factory=list)      # list[dict]
 
 
 # ── USD/JPY ラベル生成（ソース・時点を明示）────────────────────────

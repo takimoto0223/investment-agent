@@ -25,6 +25,7 @@ from report.template import (
     SwingDecision,
     build_evening_html, build_morning_html,
 )
+from report.local_html import build_morning_html_local, build_evening_html_local
 from report.mailer import send_report
 
 logger = logging.getLogger(__name__)
@@ -395,12 +396,15 @@ print('決済完了: {symbol}')
             cxo_memo=d["cxo_memo"],
             macro_notes=ctx.macro_notes,
             rotation_signal=ctx.rotation_signal,
+            us_positions_raw=report_ctx.us_positions,
         )
 
         html    = build_evening_html(report_data)
         subject = f"[投資レポート] 夜間サマリー {now.strftime('%Y/%m/%d %H:%M')}"
         ok      = send_report(subject, html)
-        logger.info(f"夕方レポート送信: {'成功' if ok else '失敗'}")
+        local_path = Path("logs/evening_report.html")
+        local_path.write_text(build_evening_html_local(report_data), encoding="utf-8")
+        logger.info(f"夕方レポート送信: {'成功' if ok else '失敗'} | ローカルHTML: {local_path}")
         return ok
 
     # ── 朝次レポート ─────────────────────────────────────────────────
@@ -477,6 +481,8 @@ print('決済完了: {symbol}')
         html    = build_morning_html(report_data)
         subject = f"[投資レポート] 朝次サマリー {now.strftime('%Y/%m/%d %H:%M')}"
         ok      = send_report(subject, html)
-        logger.info(f"朝レポート送信: {'成功' if ok else '失敗'}")
+        local_path = Path("logs/morning_report.html")
+        local_path.write_text(build_morning_html_local(report_data), encoding="utf-8")
+        logger.info(f"朝レポート送信: {'成功' if ok else '失敗'} | ローカルHTML: {local_path}")
         logger.info("=== 日次サイクル完了。次回起動は 21:00（夜間レポート）まで待機 ===")
         return ok
