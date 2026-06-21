@@ -141,6 +141,9 @@ class MorningReportData(EveningReportData):
     swing_decisions: list = field(default_factory=list)       # list[SwingDecision]
     # スイング決定（JP）kabu API 未接続中は常に空リスト
     swing_decisions_jp: list = field(default_factory=list)    # list[SwingDecision]
+    # 米国株現在ポジション生データ（Alpaca get_positions() の戻り値）
+    # unrealized_pl を 2×2 グリッドで直接表示するために保持する
+    us_positions_raw: list = field(default_factory=list)      # list[dict]
 
 
 # ── USD/JPY ラベル生成（ソース・時点を明示）────────────────────────
@@ -674,115 +677,198 @@ def _build_base_rows(data: EveningReportData) -> list:
     return rows
 
 
-# ── 朝次専用セクション ──────────────────────────────────────
+# ── 戦略 2×2 グリッド ──────────────────────────────────────
 
-def _build_morning_rows(data: MorningReportData) -> list:
-    rows = []
+def _strategy_grid(data: "MorningReportData") -> str:
+    """
+    日米×戦略の 2×2 グリッドを生成する。
+      左列: 日本株（kabu API 未接続のためいずれもkabu待ち）
+      右列: 米国株（Alpaca 実値）
+      上行: ScalpDay（スキャル）
+      下行: MomentSwing（スイング）
+    """
+    _KABU_BADGE = (
+        '<span style="background:#fef3c7;color:#92400e;font-size:9px;'
+        'padding:1px 6px;border-radius:3px;font-weight:bold;margin-left:4px;">'
+        'kabu待ち</span>'
+    )
+    _REAL_BADGE = (
+        '<span style="background:#dcfce7;color:#166534;font-size:9px;'
+        'padding:1px 6px;border-radius:3px;font-weight:bold;margin-left:4px;">'
+        '実値</span>'
+    )
+    _HDR = (
+        'font-size:10px;font-weight:bold;color:#6b7280;text-transform:uppercase;'
+        'letter-spacing:0.06em;margin-bottom:8px;padding-bottom:4px;'
+        'border-bottom:1px solid #e5e7eb;'
+    )
+    _CELL_JP = 'border:1px solid #e5e7eb;padding:12px;vertical-align:top;background:#fffbeb;'
+    _CELL_US = 'border:1px solid #e5e7eb;padding:12px;vertical-align:top;border-left:none;'
 
-    # 米国株デイトレ損益（手数料込み詳細）
+    # ── 左上: ScalpDay_JP ──────────────────────────────────
+    if data.scalpday_candidates:
+        cand_rows = ""
+        for c in data.scalpday_candidates[:5]:
+            sc = "#16a34a" if c.signal == "buy" else "#dc2626"
+            sl = "BUY" if c.signal == "buy" else "SELL"
+            cand_rows += (
+                f'<tr style="border-bottom:1px solid #f3f4f6;">'
+                f'<td style="padding:4px 6px 4px 0;vertical-align:top;">'
+                f'<span style="font-size:11px;font-weight:bold;">{c.symbol}</span><br>'
+                f'<span style="font-size:10px;color:#374151;">{c.name}</span></td>'
+                f'<td style="padding:4px 4px;vertical-align:top;text-align:center;">'
+                f'<span style="background:{sc};color:white;padding:1px 5px;'
+                f'border-radius:3px;font-size:10px;">{sl}</span></td>'
+                f'<td style="padding:4px 0;vertical-align:top;font-size:10px;color:#6b7280;">'
+                f'{c.rationale[:40]}</td>'
+                f'</tr>'
+            )
+        cell_jp_scalpday = (
+            f'<div style="font-size:11px;font-weight:bold;color:#374151;margin-bottom:4px;">'
+            f'本日スクリーニング候補（{len(data.scalpday_candidates)}件）</div>'
+            f'<table cellpadding="0" cellspacing="0" width="100%">{cand_rows}</table>'
+        )
+    else:
+        cell_jp_scalpday = '<p style="color:#9ca3af;font-size:12px;margin:0 0 4px;">候補なし</p>'
+
+    cell_jp_scalpday += (
+        '<div style="margin-top:8px;font-size:11px;color:#6b7280;">'
+        '含み損益: <span style="color:#b45309;">kabu接続待ち</span>'
+        ' &nbsp;／&nbsp; '
+        '確定P&amp;L: <span style="color:#b45309;">kabu接続待ち</span>'
+        '</div>'
+    )
+
+    # ── 右上: ScalpDay_US ──────────────────────────────────
     net_c  = "#16a34a" if data.daytrade_net_pl >= 0 else "#dc2626"
     net_s  = "+" if data.daytrade_net_pl >= 0 else ""
     gross_c = "#16a34a" if data.daytrade_gross_pl >= 0 else "#dc2626"
     gross_s = "+" if data.daytrade_gross_pl >= 0 else ""
 
-    # 手数料注記（Alpacaは売り時のみSEC fee + FINRA TAF、買い手数料$0）
-    fee_note = (
-        f'SEC fee ${data.daytrade_fees * 0.9:.4f} + '
-        f'FINRA TAF ${data.daytrade_fees * 0.1:.4f}'
-        if data.daytrade_fees > 0 else "手数料なし"
-    )
-    dt_rows_html = ""
-    for t in data.daytrade_records:
+    dt_rows = ""
+    for t in data.daytrade_records[:5]:
         t_c = "#16a34a" if t["net_pl"] >= 0 else "#dc2626"
         t_s = "+" if t["net_pl"] >= 0 else ""
-        dt_rows_html += (
+        dt_rows += (
             f'<tr style="border-bottom:1px solid #f3f4f6;">'
-            f'<td style="padding:4px 8px 4px 0;font-size:12px;font-weight:bold;">{t["symbol"]}</td>'
-            f'<td style="padding:4px 8px;font-size:11px;color:#6b7280;">'
-            f'買 ${t["buy_price"]:.2f} → 売 ${t["sell_price"]:.2f} × {t["qty"]:.0f}株</td>'
-            f'<td style="padding:4px 0;font-size:12px;color:{t_c};text-align:right;">'
-            f'{t_s}${t["net_pl"]:.2f}</td>'
+            f'<td style="padding:3px 6px 3px 0;font-size:11px;font-weight:bold;">{t["symbol"]}</td>'
+            f'<td style="padding:3px 4px;font-size:10px;color:#6b7280;">'
+            f'${t["buy_price"]:.0f}→${t["sell_price"]:.0f} ×{t["qty"]:.0f}</td>'
+            f'<td style="padding:3px 0;font-size:11px;color:{t_c};text-align:right;">{t_s}${t["net_pl"]:.2f}</td>'
             f'</tr>'
         )
-    if not dt_rows_html:
-        dt_rows_html = '<tr><td colspan="3" style="padding:6px 0;font-size:12px;color:#9ca3af;">約定履歴なし</td></tr>'
+    if not dt_rows:
+        dt_rows = (
+            '<tr><td colspan="3" style="color:#9ca3af;font-size:11px;padding:4px 0;">'
+            '約定なし（昨夜）</td></tr>'
+        )
 
-    # ── 戦略別サマリー（ScalpDay_JP → ScalpDay_US → MomentSwing_JP → MomentSwing_US）──
+    fee_note = f'-${data.daytrade_fees:.4f}' if data.daytrade_fees > 0 else '$0'
+    cell_us_scalpday = (
+        f'<div style="font-size:20px;font-weight:bold;color:{net_c};">'
+        f'{net_s}${data.daytrade_net_pl:,.2f}</div>'
+        f'<div style="font-size:10px;color:#6b7280;margin-bottom:8px;">'
+        f'ネット（手数料後） ／ グロス {gross_s}${data.daytrade_gross_pl:,.2f} ／ 手数料 {fee_note}</div>'
+        f'<table cellpadding="0" cellspacing="0" width="100%">{dt_rows}</table>'
+        f'<div style="margin-top:6px;font-size:10px;color:#9ca3af;">'
+        f'含み損益: なし（当日決済前提）</div>'
+    )
 
-    rows.append(_section_header("戦略別サマリー"))
+    # ── 左下: MomentSwing_JP ──────────────────────────────
+    cell_jp_swing = (
+        '<p style="color:#9ca3af;font-size:12px;margin:0 0 8px;">'
+        'セッション未実行（kabu API 未接続）</p>'
+        '<div style="font-size:11px;color:#6b7280;">'
+        '保有ポジション: <span style="color:#b45309;">kabu接続待ち</span><br>'
+        '含み損益: <span style="color:#b45309;">kabu接続待ち</span><br>'
+        '確定P&amp;L: <span style="color:#b45309;">kabu接続待ち</span>'
+        '</div>'
+    )
 
-    # ScalpDay_JP: 本日デイトレ候補（日本株）
-    rows.append(_card("本日デイトレ候補（日本株）", _scalpday_candidate_table(data.scalpday_candidates)))
+    # ── 右下: MomentSwing_US ──────────────────────────────
+    us_pos_rows = ""
+    for pos in data.us_positions_raw:
+        try:
+            symbol = pos.get("symbol", "")
+            qty    = float(pos.get("qty", 0))
+            curr   = float(pos.get("current_price", 0))
+            upl    = float(pos.get("unrealized_pl", 0))
+            upl_c  = "#16a34a" if upl >= 0 else "#dc2626"
+            upl_s  = "+" if upl >= 0 else "-"
+            us_pos_rows += (
+                f'<tr style="border-bottom:1px solid #f3f4f6;">'
+                f'<td style="padding:4px 6px 4px 0;font-size:11px;font-weight:bold;">{symbol}</td>'
+                f'<td style="padding:4px 4px;font-size:10px;color:#6b7280;">{qty:.0f}株 @${curr:.2f}</td>'
+                f'<td style="padding:4px 0;font-size:11px;color:{upl_c};text-align:right;">{upl_s}${abs(upl):,.2f}</td>'
+                f'</tr>'
+            )
+        except Exception:
+            continue
 
-    # ScalpDay_US: 昨夜のデイトレ損益
-    rows.append(_card("米国株デイトレ 昨夜の損益", (
-        f'<table cellpadding="0" cellspacing="0" width="100%"><tr>'
-        f'<td style="vertical-align:top;padding-right:20px;">'
-        f'<div style="font-size:22px;font-weight:bold;color:{net_c};">'
-        f'{net_s}${data.daytrade_net_pl:,.2f} <span style="font-size:13px;">（手数料後）</span></div>'
-        f'<div style="font-size:12px;color:{gross_c};margin-top:2px;">'
-        f'グロス {gross_s}${data.daytrade_gross_pl:,.2f}'
-        f' ／ 手数料 -${data.daytrade_fees:.4f}</div>'
-        f'<div style="font-size:10px;color:#9ca3af;margin-top:2px;">{fee_note}</div>'
-        f'<div style="font-size:11px;color:#6b7280;margin-top:4px;">'
-        f'Alpaca手数料: 買い$0 / 売りはSEC fee＋FINRA TАF のみ</div>'
+    if not us_pos_rows:
+        us_pos_rows = (
+            '<tr><td colspan="3" style="color:#9ca3af;font-size:11px;padding:4px 0;">'
+            '保有なし</td></tr>'
+        )
+
+    cell_us_swing = (
+        f'<table cellpadding="0" cellspacing="0" width="100%">'
+        f'<tr style="background:#f9fafb;">'
+        f'<th style="padding:3px 6px 3px 0;font-size:10px;color:#6b7280;text-align:left;font-weight:normal;">銘柄</th>'
+        f'<th style="padding:3px 4px;font-size:10px;color:#6b7280;text-align:left;font-weight:normal;">数量/価格</th>'
+        f'<th style="padding:3px 0;font-size:10px;color:#6b7280;text-align:right;font-weight:normal;">含み損益</th>'
+        f'</tr>'
+        f'{us_pos_rows}'
+        f'</table>'
+        f'<div style="margin-top:8px;font-size:10px;color:#9ca3af;">'
+        f'確定P&amp;L: 未実装（スイング確定損益の追跡なし）</div>'
+    )
+
+    # ── 2×2 テーブル組み立て ──────────────────────────────
+    col_hdr = 'padding:6px 0;font-size:11px;font-weight:bold;color:#374151;text-align:center;'
+    return (
+        f'<table cellpadding="0" cellspacing="0" width="100%">'
+        # 列ヘッダー
+        f'<tr>'
+        f'<td width="50%" style="{col_hdr}padding-right:1px;">日本株</td>'
+        f'<td width="50%" style="{col_hdr}">米国株</td>'
+        f'</tr>'
+        # 上行: ScalpDay
+        f'<tr>'
+        f'<td style="{_CELL_JP}">'
+        f'<div style="{_HDR}">ScalpDay（スキャル）{_KABU_BADGE}</div>'
+        f'{cell_jp_scalpday}'
         f'</td>'
-        f'<td style="vertical-align:top;width:55%;">'
-        f'<table cellpadding="0" cellspacing="0" width="100%">{dt_rows_html}</table>'
-        f'</td></tr></table>'
-    )))
+        f'<td style="{_CELL_US}">'
+        f'<div style="{_HDR}">ScalpDay（スキャル）{_REAL_BADGE}</div>'
+        f'{cell_us_scalpday}'
+        f'</td>'
+        f'</tr>'
+        # 下行: MomentSwing
+        f'<tr>'
+        f'<td style="{_CELL_JP}border-top:none;">'
+        f'<div style="{_HDR}">MomentSwing（スイング）{_KABU_BADGE}</div>'
+        f'{cell_jp_swing}'
+        f'</td>'
+        f'<td style="{_CELL_US}border-top:none;">'
+        f'<div style="{_HDR}">MomentSwing（スイング）{_REAL_BADGE}（含み）</div>'
+        f'{cell_us_swing}'
+        f'</td>'
+        f'</tr>'
+        f'</table>'
+    )
 
-    # MomentSwing_JP: 昨日の売買判断（kabu API 未接続中は「セッション未実行」を表示）
-    if data.swing_decisions_jp:
-        jp_val_rows = ""
-        for v in data.swing_decisions_jp:
-            badge_c, badge_t = ("#16a34a", "買付") if v.action == "buy" else ("#6b7280", "見送")
-            qty_txt = f" × {v.qty:.0f}株" if v.qty > 0 else ""
-            jp_val_rows += (
-                f'<tr style="border-bottom:1px solid #f3f4f6;">'
-                f'<td style="padding:5px 8px 5px 0;vertical-align:top;white-space:nowrap;">'
-                f'<span style="background:{badge_c};color:white;font-size:10px;'
-                f'padding:1px 5px;border-radius:3px;">{badge_t}</span></td>'
-                f'<td style="padding:5px 8px;vertical-align:top;font-size:12px;font-weight:bold;">'
-                f'{v.name or v.symbol}{qty_txt}</td>'
-                f'<td style="padding:5px 0;vertical-align:top;font-size:11px;color:#6b7280;">'
-                f'{v.rationale}</td>'
-                f'</tr>'
-            )
-        rows.append(_card("スイング 昨日の売買判断（日本株）", (
-            f'<table cellpadding="0" cellspacing="0" width="100%">{jp_val_rows}</table>'
-        )))
-    else:
-        rows.append(_card("スイング 昨日の売買判断（日本株）", (
-            '<p style="color:#9ca3af;font-size:13px;margin:0;">'
-            'セッション未実行（kabu API 未接続またはセッションなし）</p>'
-        )))
 
-    # MomentSwing_US: 昨日の売買判断
-    if data.swing_decisions:
-        val_rows_html = ""
-        for v in data.swing_decisions:
-            badge_c, badge_t = ("#16a34a", "買付") if v.action == "buy" else ("#6b7280", "見送")
-            qty_txt = f" × {v.qty:.0f}株" if v.qty > 0 else ""
-            val_rows_html += (
-                f'<tr style="border-bottom:1px solid #f3f4f6;">'
-                f'<td style="padding:5px 8px 5px 0;vertical-align:top;white-space:nowrap;">'
-                f'<span style="background:{badge_c};color:white;font-size:10px;'
-                f'padding:1px 5px;border-radius:3px;">{badge_t}</span></td>'
-                f'<td style="padding:5px 8px;vertical-align:top;font-size:12px;font-weight:bold;">'
-                f'{v.name or v.symbol}{qty_txt}</td>'
-                f'<td style="padding:5px 0;vertical-align:top;font-size:11px;color:#6b7280;">'
-                f'{v.rationale}</td>'
-                f'</tr>'
-            )
-        rows.append(_card("スイング 昨日の売買判断（米国株）", (
-            f'<table cellpadding="0" cellspacing="0" width="100%">{val_rows_html}</table>'
-        )))
-    else:
-        rows.append(_card("スイング 昨日の売買判断（米国株）", (
-            '<p style="color:#9ca3af;font-size:13px;margin:0;">昨夜のセッションなし</p>'
-        )))
+# ── 朝次専用セクション ──────────────────────────────────────
 
+def _build_morning_rows(data: MorningReportData) -> list:
+    rows = []
+    rows.append(_section_header("戦略別サマリー"))
+    rows.append(
+        f'<tr><td style="padding:16px 24px 20px;">'
+        f'{_strategy_grid(data)}'
+        f'</td></tr>'
+    )
     return rows
 
 

@@ -471,6 +471,7 @@ print('決済完了: {symbol}')
             daytrade_net_pl=extras["daytrade_net_pl"],
             swing_decisions=extras["swing_decisions"],
             swing_decisions_jp=extras["swing_decisions_jp"],
+            us_positions_raw=report_ctx.us_positions,
         )
 
         html    = build_morning_html(report_data)

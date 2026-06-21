@@ -47,11 +47,11 @@ _FX_SIGNAL = {
 
 _US_POSITIONS = [
     {"symbol": "NVDA", "qty": "2",  "avg_entry_price": "800.00",
-     "current_price": "850.00", "market_value": "1700.00"},
+     "current_price": "850.00", "market_value": "1700.00", "unrealized_pl": "100.00"},
     {"symbol": "MSFT", "qty": "3",  "avg_entry_price": "410.00",
-     "current_price": "420.00", "market_value": "1260.00"},
+     "current_price": "420.00", "market_value": "1260.00", "unrealized_pl":  "30.00"},
     {"symbol": "AAPL", "qty": "5",  "avg_entry_price": "195.00",
-     "current_price": "192.00", "market_value":  "960.00"},
+     "current_price": "192.00", "market_value":  "960.00", "unrealized_pl": "-15.00"},
 ]
 
 _REPORT_CTX = CXOReportContext(
@@ -148,28 +148,55 @@ def _evening_checks(html: str) -> list[tuple[bool, str]]:
 def _morning_extra_checks(html: str) -> list[tuple[bool, str]]:
     """
     朝次レポート追加チェック（_evening_checks の後に実行）。
-    カードタイトル + 注入した具体値で確認する。
+    2×2 グリッド構造 + 注入した具体値で確認する。
     """
     def chk(*needles: str) -> bool:
         return all(n in html for n in needles)
 
     return [
-        # デイトレ損益: カードが出て注入した P&L 値が表示される
-        (chk("米国株デイトレ 昨夜の損益"),
-            "デイトレ損益 カード出力"),
-        (chk("+$87.08"),
-            "デイトレ ネット損益 +$87.08 表示（_DAYTRADE_PL.total_net）"),
-        (chk("$87.50"),
-            "デイトレ グロス損益 $87.50 表示（_DAYTRADE_PL.total_gross）"),
+        # セクションヘッダー
+        (chk("戦略別サマリー"),
+            "戦略別サマリー セクションヘッダー出力"),
 
-        # ScalpDay候補: カードが出て候補の根拠テキスト（ユニーク文字列）が表示される
-        # ※銘柄名は JP 保有ダミーデータにも出るため、根拠テキストで確認する
-        (chk("本日デイトレ候補（日本株）"),
-            "ScalpDay候補 カード出力"),
+        # 2×2 グリッド: 列ヘッダー
+        (chk("日本株", "米国株"),
+            "グリッド列ヘッダー（日本株・米国株）出力"),
+
+        # 2×2 グリッド: セル見出し
+        (chk("ScalpDay（スキャル）"),
+            "ScalpDay 行ヘッダー出力"),
+        (chk("MomentSwing（スイング）"),
+            "MomentSwing 行ヘッダー出力"),
+
+        # JP セル: kabu待ちラベル
+        (chk("kabu待ち", "kabu接続待ち"),
+            "JP セル kabu待ちラベル出力"),
+
+        # ScalpDay_US: 注入した P&L 値
+        (chk("+$87.08"),
+            "ScalpDay_US ネット損益 +$87.08 表示（_DAYTRADE_PL.total_net）"),
+        (chk("$87.50"),
+            "ScalpDay_US グロス損益 $87.50 表示（_DAYTRADE_PL.total_gross）"),
+
+        # ScalpDay_JP: 候補の根拠テキスト（ユニーク文字列）
         (chk("出来高急増・AI半導体セクター優位"),
-            "候補1（アドバンテスト）の根拠テキスト表示"),
+            "ScalpDay_JP 候補1（アドバンテスト）の根拠テキスト表示"),
         (chk("ATR拡大・利確水準接近"),
-            "候補3（信越化学）の根拠テキスト表示"),
+            "ScalpDay_JP 候補3（信越化学）の根拠テキスト表示"),
+
+        # MomentSwing_US: 保有銘柄の含み損益（注入した _US_POSITIONS.unrealized_pl）
+        (chk("NVDA", "+$100.00"),
+            "MomentSwing_US NVDA 含み損益 +$100.00 表示"),
+        (chk("AAPL", "-$15.00"),
+            "MomentSwing_US AAPL 含み損益 -$15.00 表示（マイナス値確認）"),
+
+        # MomentSwing_US: 確定P&L 未実装ラベル
+        (chk("確定P&amp;L: 未実装"),
+            "MomentSwing_US 確定P&L 未実装ラベル出力"),
+
+        # MomentSwing_JP: kabu未接続ラベル
+        (chk("セッション未実行（kabu API 未接続）"),
+            "MomentSwing_JP セッション未実行ラベル出力"),
     ]
 
 
@@ -210,17 +237,21 @@ def _sabotage_tests(html_eve: str, html_mor: str) -> bool:
          lambda h: all(n in h for n in ["AI半導体", "データセンターインフラ", "宇宙インフラ"]),
          "セクター削除 → セクター全描画チェックが NG になる"),
 
-        (html_mor, "米国株デイトレ 昨夜の損益",
-         lambda h: "米国株デイトレ 昨夜の損益" in h,
-         "デイトレカード削除 → カード出力チェックが NG になる"),
-
         (html_mor, "+$87.08",
          lambda h: "+$87.08" in h,
-         "デイトレ金額削除 → ネット損益チェックが NG になる"),
+         "ScalpDay_US ネット損益削除 → +$87.08 チェックが NG になる"),
 
         (html_mor, "出来高急増・AI半導体セクター優位",
          lambda h: "出来高急増・AI半導体セクター優位" in h,
-         "候補根拠削除 → 根拠テキストチェックが NG になる"),
+         "ScalpDay_JP 候補根拠削除 → 根拠テキストチェックが NG になる"),
+
+        (html_mor, "+$100.00",
+         lambda h: "+$100.00" in h,
+         "MomentSwing_US NVDA含み損益削除 → +$100.00 チェックが NG になる"),
+
+        (html_mor, "kabu接続待ち",
+         lambda h: "kabu接続待ち" in h,
+         "JP kabu待ちラベル削除 → kabu接続待ちチェックが NG になる"),
     ]
 
     all_pass = True
