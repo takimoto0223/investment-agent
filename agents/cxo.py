@@ -70,11 +70,13 @@ class CXOAgent(BaseAgent):
         """
         生きているセッションログを読んで返す。
           - moment_swing_us_log.json : MomentSwing_US スイング投資の発注・見送り記録
+          - moment_swing_jp_log.json : MomentSwing_JP スイング投資の発注・見送り記録（kabu 未接続中は存在しない）
           - scalpday_us_log.json     : ScalpDay_US デイトレ発注ログ（trade_count のフォールバック用）
         discussion_log.json は廃止済みのため読まない。
         """
         return {
             "moment_swing_us_log": self._read_json_log(Path("logs/moment_swing_us_log.json")),
+            "moment_swing_jp_log": self._read_json_log(Path("logs/moment_swing_jp_log.json")),
             "scalpday_us_log":     self._read_json_log(Path("logs/scalpday_us_log.json")),
         }
 
@@ -267,15 +269,37 @@ class CXOAgent(BaseAgent):
                     rationale=rj.get("reason", ""),
                 ))
 
+        # ── MomentSwingJP 買い/見送り決定（kabu 未接続中はログが存在しないため空リスト）──
+        swing_decisions_jp: list[SwingDecision] = []
+        jp_val_sessions = logs.get("moment_swing_jp_log", [])
+        if jp_val_sessions:
+            latest_jp = jp_val_sessions[-1]
+            for ex in latest_jp.get("executed", []):
+                swing_decisions_jp.append(SwingDecision(
+                    symbol=ex.get("symbol", ""),
+                    name=ex.get("name", ex.get("symbol", "")),
+                    action="buy",
+                    rationale=ex.get("rationale", ""),
+                    qty=float(ex.get("qty", 0)),
+                ))
+            for rj in latest_jp.get("rejected", []):
+                swing_decisions_jp.append(SwingDecision(
+                    symbol=rj.get("symbol", ""),
+                    name=rj.get("symbol", ""),
+                    action="reject",
+                    rationale=rj.get("reason", ""),
+                ))
+
         return {
-            "us_realized_pl_usd": us_realized_pl_usd,
-            "us_trade_count":     us_trade_count,
-            "daytrade_records":   daytrade_records,
-            "daytrade_gross_pl":  daytrade_gross_pl,
-            "daytrade_fees":      daytrade_fees,
-            "daytrade_net_pl":    daytrade_net_pl,
+            "us_realized_pl_usd":  us_realized_pl_usd,
+            "us_trade_count":      us_trade_count,
+            "daytrade_records":    daytrade_records,
+            "daytrade_gross_pl":   daytrade_gross_pl,
+            "daytrade_fees":       daytrade_fees,
+            "daytrade_net_pl":     daytrade_net_pl,
             "scalpday_candidates": scalpday_candidates or [],
-            "swing_decisions":    swing_decisions,
+            "swing_decisions":     swing_decisions,
+            "swing_decisions_jp":  swing_decisions_jp,
         }
 
     # ── 要承認通知 ──────────────────────────────────────────────────
@@ -446,6 +470,7 @@ print('決済完了: {symbol}')
             daytrade_fees=extras["daytrade_fees"],
             daytrade_net_pl=extras["daytrade_net_pl"],
             swing_decisions=extras["swing_decisions"],
+            swing_decisions_jp=extras["swing_decisions_jp"],
         )
 
         html    = build_morning_html(report_data)

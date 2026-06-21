@@ -137,8 +137,10 @@ class MorningReportData(EveningReportData):
     daytrade_gross_pl: float = 0.0      # グロス損益 (USD)
     daytrade_fees: float = 0.0          # 手数料合計 (USD)
     daytrade_net_pl: float = 0.0        # ネット損益 (USD)
-    # スイング決定
+    # スイング決定（US）
     swing_decisions: list = field(default_factory=list)       # list[SwingDecision]
+    # スイング決定（JP）kabu API 未接続中は常に空リスト
+    swing_decisions_jp: list = field(default_factory=list)    # list[SwingDecision]
 
 
 # ── USD/JPY ラベル生成（ソース・時点を明示）────────────────────────
@@ -450,6 +452,19 @@ def _scalpday_candidate_table(candidates: list) -> str:
     )
 
 
+# ── セクション区切り見出し ────────────────────────────────────────
+
+def _section_header(title: str) -> str:
+    """カード群の上に置くセクション区切り見出し行。"""
+    return (
+        f'<tr><td style="padding:16px 24px 4px;'
+        f'font-size:11px;font-weight:bold;color:#6b7280;'
+        f'text-transform:uppercase;letter-spacing:0.08em;'
+        f'border-top:2px solid #e5e7eb;">'
+        f'{title}</td></tr>'
+    )
+
+
 # ── カードラッパー ──────────────────────────────────────────────
 
 def _card(title: str, content: str) -> str:
@@ -586,6 +601,18 @@ def _build_base_rows(data: EveningReportData) -> list:
         f'</tr></table>'
     )))
 
+    # CxO方針メモ（保有銘柄の直後・リスク判断の前）
+    rows.append(_card("CxO方針メモ", (
+        f'<div style="background:#f0f9ff;border-left:4px solid #3b82f6;'
+        f'padding:12px 16px;border-radius:0 6px 6px 0;">'
+        f'<div style="font-size:13px;color:#1e3a5f;line-height:1.7;">'
+        f'{data.cxo_memo}</div></div>'
+        f'<div style="font-size:11px;color:#6b7280;margin-top:10px;">'
+        f'<strong>マクロ:</strong> {data.macro_notes}<br>'
+        f'<strong>ローテーション:</strong> {data.rotation_signal}'
+        f'</div>'
+    )))
+
     # リスクメーター（5段階）+ 円ドル保有割合バー（2段）
     rows.append(_card("リスク・通貨配分", (
         f'<table cellpadding="0" cellspacing="0" width="100%"><tr>'
@@ -603,16 +630,36 @@ def _build_base_rows(data: EveningReportData) -> list:
         f'</tr></table>'
     )))
 
-    # 為替エージェント判定バッジ
+    # 為替（FXシグナル + USD/JPYレート + 朝のみ:夜間変動 を1枚に統合）
+    # 「米国株セッション開始前FXシグナル」は現状 fx_signal と同値のため統合・廃止。
+    # 将来 22:30 直前に別途 FXAgent を呼ぶ配線ができたら復活させる（backlog 記録済み）
     rationale = (data.fx_rationale or "")[:120]
-    rows.append(_card("為替エージェント判定", (
-        f'<table cellpadding="0" cellspacing="0"><tr>'
-        f'<td style="vertical-align:middle;padding-right:12px;">'
-        f'{_fx_badge(data.fx_signal)}</td>'
-        f'<td style="font-size:12px;color:#6b7280;vertical-align:middle;">'
-        f'{rationale}</td></tr></table>'
-        f'<div style="font-size:11px;color:#9ca3af;margin-top:6px;">'
-        f'USD/JPY: {_usdjpy_label(data)}</div>'
+    overnight_html = ""
+    if isinstance(data, MorningReportData):
+        fx_c  = "#16a34a" if data.overnight_fx_change_pct >= 0 else "#dc2626"
+        fx_s  = "+" if data.overnight_fx_change_pct >= 0 else ""
+        high_s = f"高値 {data.overnight_fx_high:.2f}" if data.overnight_fx_high else ""
+        low_s  = f"安値 {data.overnight_fx_low:.2f}"  if data.overnight_fx_low  else ""
+        range_s = " / ".join(filter(None, [high_s, low_s])) or "データなし"
+        overnight_html = (
+            f'<div style="margin-top:8px;font-size:12px;color:#6b7280;">'
+            f'夜間変動: <span style="color:{fx_c};font-weight:bold;">'
+            f'{fx_s}{data.overnight_fx_change_pct:.2f}%</span>'
+            f'&nbsp;&nbsp;{range_s}</div>'
+            f'<div style="font-size:11px;color:#9ca3af;margin-top:2px;">'
+            f'{data.overnight_fx_summary}</div>'
+        )
+    rows.append(_card("為替", (
+        f'<table cellpadding="0" cellspacing="0" width="100%"><tr>'
+        f'<td style="vertical-align:top;padding-right:16px;">'
+        f'{_fx_badge(data.fx_signal)}'
+        f'<div style="font-size:12px;color:#111827;font-weight:bold;margin-top:8px;">'
+        f'USD/JPY {_usdjpy_label(data)}</div>'
+        f'{overnight_html}'
+        f'</td>'
+        f'<td style="font-size:12px;color:#6b7280;vertical-align:top;">'
+        f'{rationale}</td>'
+        f'</tr></table>'
     )))
 
     # 信用建玉の状況
@@ -623,29 +670,6 @@ def _build_base_rows(data: EveningReportData) -> list:
 
     # 保有ポジション一覧（銘柄・保有額・PF比・前日比）
     rows.append(_card("保有ポジション一覧", _position_table(data.all_positions)))
-
-    # 米国株セッション開始前FXシグナル
-    pre_sig = data.pre_us_fx_signal or data.fx_signal
-    pre_rat = (data.pre_us_fx_rationale or data.fx_rationale or "")[:120]
-    rows.append(_card("米国株セッション開始前 FXシグナル", (
-        f'<table cellpadding="0" cellspacing="0"><tr>'
-        f'<td style="vertical-align:middle;padding-right:12px;">'
-        f'{_fx_badge(pre_sig)}</td>'
-        f'<td style="font-size:12px;color:#6b7280;vertical-align:middle;">'
-        f'{pre_rat}</td></tr></table>'
-    )))
-
-    # CxO方針メモ
-    rows.append(_card("CxO方針メモ", (
-        f'<div style="background:#f0f9ff;border-left:4px solid #3b82f6;'
-        f'padding:12px 16px;border-radius:0 6px 6px 0;">'
-        f'<div style="font-size:13px;color:#1e3a5f;line-height:1.7;">'
-        f'{data.cxo_memo}</div></div>'
-        f'<div style="font-size:11px;color:#6b7280;margin-top:10px;">'
-        f'<strong>マクロ:</strong> {data.macro_notes}<br>'
-        f'<strong>ローテーション:</strong> {data.rotation_signal}'
-        f'</div>'
-    )))
 
     return rows
 
@@ -683,6 +707,14 @@ def _build_morning_rows(data: MorningReportData) -> list:
     if not dt_rows_html:
         dt_rows_html = '<tr><td colspan="3" style="padding:6px 0;font-size:12px;color:#9ca3af;">約定履歴なし</td></tr>'
 
+    # ── 戦略別サマリー（ScalpDay_JP → ScalpDay_US → MomentSwing_JP → MomentSwing_US）──
+
+    rows.append(_section_header("戦略別サマリー"))
+
+    # ScalpDay_JP: 本日デイトレ候補（日本株）
+    rows.append(_card("本日デイトレ候補（日本株）", _scalpday_candidate_table(data.scalpday_candidates)))
+
+    # ScalpDay_US: 昨夜のデイトレ損益
     rows.append(_card("米国株デイトレ 昨夜の損益", (
         f'<table cellpadding="0" cellspacing="0" width="100%"><tr>'
         f'<td style="vertical-align:top;padding-right:20px;">'
@@ -700,38 +732,37 @@ def _build_morning_rows(data: MorningReportData) -> list:
         f'</td></tr></table>'
     )))
 
-    # 日本株 本日デイトレ候補
-    rows.append(_card("本日デイトレ候補（日本株）", _scalpday_candidate_table(data.scalpday_candidates)))
+    # MomentSwing_JP: 昨日の売買判断（kabu API 未接続中は「セッション未実行」を表示）
+    if data.swing_decisions_jp:
+        jp_val_rows = ""
+        for v in data.swing_decisions_jp:
+            badge_c, badge_t = ("#16a34a", "買付") if v.action == "buy" else ("#6b7280", "見送")
+            qty_txt = f" × {v.qty:.0f}株" if v.qty > 0 else ""
+            jp_val_rows += (
+                f'<tr style="border-bottom:1px solid #f3f4f6;">'
+                f'<td style="padding:5px 8px 5px 0;vertical-align:top;white-space:nowrap;">'
+                f'<span style="background:{badge_c};color:white;font-size:10px;'
+                f'padding:1px 5px;border-radius:3px;">{badge_t}</span></td>'
+                f'<td style="padding:5px 8px;vertical-align:top;font-size:12px;font-weight:bold;">'
+                f'{v.name or v.symbol}{qty_txt}</td>'
+                f'<td style="padding:5px 0;vertical-align:top;font-size:11px;color:#6b7280;">'
+                f'{v.rationale}</td>'
+                f'</tr>'
+            )
+        rows.append(_card("スイング 昨日の売買判断（日本株）", (
+            f'<table cellpadding="0" cellspacing="0" width="100%">{jp_val_rows}</table>'
+        )))
+    else:
+        rows.append(_card("スイング 昨日の売買判断（日本株）", (
+            '<p style="color:#9ca3af;font-size:13px;margin:0;">'
+            'セッション未実行（kabu API 未接続またはセッションなし）</p>'
+        )))
 
-    # 夜間の為替変動サマリー
-    fx_c  = "#16a34a" if data.overnight_fx_change_pct >= 0 else "#dc2626"
-    fx_s  = "+" if data.overnight_fx_change_pct >= 0 else ""
-    high_s = f"高値 {data.overnight_fx_high:.2f}" if data.overnight_fx_high else ""
-    low_s  = f"安値 {data.overnight_fx_low:.2f}"  if data.overnight_fx_low  else ""
-    range_s = " / ".join(filter(None, [high_s, low_s])) or "データなし"
-    rows.append(_card("夜間の為替変動サマリー", (
-        f'<table cellpadding="0" cellspacing="0"><tr>'
-        f'<td style="padding-right:24px;vertical-align:top;">'
-        f'<div style="font-size:20px;font-weight:bold;color:#111827;">'
-        f'USD/JPY {_usdjpy_label(data)}</div>'
-        f'<div style="font-size:12px;color:{fx_c};margin-top:2px;">'
-        f'{fx_s}{data.overnight_fx_change_pct:.2f}%</div>'
-        f'</td>'
-        f'<td style="vertical-align:bottom;">'
-        f'<div style="font-size:12px;color:#6b7280;">{range_s}</div>'
-        f'</td></tr></table>'
-        f'<div style="font-size:12px;color:#6b7280;margin-top:6px;">'
-        f'{data.overnight_fx_summary}</div>'
-    )))
-
-    # MomentSwing 昨日の買い/見送り決定サマリー
+    # MomentSwing_US: 昨日の売買判断
     if data.swing_decisions:
         val_rows_html = ""
         for v in data.swing_decisions:
-            if v.action == "buy":
-                badge_c, badge_t = "#16a34a", "買付"
-            else:
-                badge_c, badge_t = "#6b7280", "見送"
+            badge_c, badge_t = ("#16a34a", "買付") if v.action == "buy" else ("#6b7280", "見送")
             qty_txt = f" × {v.qty:.0f}株" if v.qty > 0 else ""
             val_rows_html += (
                 f'<tr style="border-bottom:1px solid #f3f4f6;">'
@@ -744,10 +775,13 @@ def _build_morning_rows(data: MorningReportData) -> list:
                 f'{v.rationale}</td>'
                 f'</tr>'
             )
-        rows.append(_card("スイング 昨日の売買判断", (
+        rows.append(_card("スイング 昨日の売買判断（米国株）", (
             f'<table cellpadding="0" cellspacing="0" width="100%">{val_rows_html}</table>'
         )))
-
+    else:
+        rows.append(_card("スイング 昨日の売買判断（米国株）", (
+            '<p style="color:#9ca3af;font-size:13px;margin:0;">昨夜のセッションなし</p>'
+        )))
 
     return rows
 
