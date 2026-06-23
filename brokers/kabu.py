@@ -91,6 +91,24 @@ class KabuBroker:
         return resp.json()
 
     # ------------------------------------------------------------------
+    # 銘柄登録
+    # ------------------------------------------------------------------
+    def register_symbols(self, symbols: list[dict]) -> dict:
+        """銘柄をリアルタイム配信登録する（PUT /register）。
+        Why: REST /board は事前の銘柄登録が前提となっている。公式リファレンスには
+        自動登録の記載があるが実際は登録なしでは board が空/エラーになる。
+        symbols 例: [{"Symbol": "7203", "Exchange": 1}]
+        """
+        resp = requests.put(
+            f"{self.base_url}/register",
+            headers=self.headers,
+            json={"Symbols": symbols},
+            timeout=KABU.timeout_sec,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    # ------------------------------------------------------------------
     # 株価情報
     # ------------------------------------------------------------------
     def get_board(self, symbol: str, exchange: int = 1) -> dict:
@@ -101,6 +119,20 @@ class KabuBroker:
         resp = requests.get(
             f"{self.base_url}/board/{symbol}@{exchange}",
             headers=self.headers,
+            timeout=KABU.timeout_sec,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    # ------------------------------------------------------------------
+    # 注文照会
+    # ------------------------------------------------------------------
+    def get_orders(self, product: int = 1) -> list[dict]:
+        """注文一覧を取得。product: 1=株式(デフォルト), 0=全商品"""
+        resp = requests.get(
+            f"{self.base_url}/orders",
+            headers=self.headers,
+            params={"product": product},
             timeout=KABU.timeout_sec,
         )
         resp.raise_for_status()
