@@ -13,6 +13,9 @@ import requests
 from config.settings import KABU
 from brokers.kabu import KabuBroker
 
+# Windows コンソールの既定エンコードは cp932 のため日本語が化ける。UTF-8 に再設定する。
+sys.stdout.reconfigure(encoding="utf-8")
+
 
 def main() -> int:
     print(f"env      : {KABU.env}")
