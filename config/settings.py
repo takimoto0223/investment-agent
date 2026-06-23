@@ -86,8 +86,28 @@ class LLMConfig:
     max_tokens: int = 2048
 
 
+@dataclass
+class JQuantsConfig:
+    """J-Quants API v2 設定。
+
+    認証は JQUANTS_API_KEY のみ使用する。
+    Why: J-Quants V1 認証エンドポイント(auth_user / auth_refresh)は廃止され 410 を返すため、
+    V1 の refresh_token / mail+password 経路は存在しない。
+    """
+    api_key: str = field(default_factory=lambda: os.getenv("JQUANTS_API_KEY", ""))
+
+    def validate(self) -> None:
+        """API キー未設定なら EnvironmentError を送出する。"""
+        if not self.api_key:
+            raise EnvironmentError(
+                "JQUANTS_API_KEY が未設定です。\n"
+                "  J-Quants サイト → マイページ → API キー で発行して .env に設定してください。"
+            )
+
+
 # シングルトン的に使うグローバルインスタンス
 RISK = RiskLimits()
 KABU = KabuConfig()
 ALPACA = AlpacaConfig()
 LLM = LLMConfig()
+JQUANTS = JQuantsConfig()

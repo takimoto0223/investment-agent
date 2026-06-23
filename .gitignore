@@ -97,5 +97,9 @@ coverage.xml
 # Backtests (large data files / run artifacts)
 backtests/
 
+# J-Quants 取得データ（コードから再生成可能。J-Quants 規約で再配布禁止）
+data/historical/bars/*.csv.gz
+data/historical/bars/*.parquet
+
 # Claude Code internal files
 .claude/

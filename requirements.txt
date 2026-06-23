@@ -17,3 +17,9 @@ schedule>=1.2.0
 
 # 日本の祝日判定（振替休日・浮動祝日含む）
 jpholiday>=1.0.0
+
+# J-Quants 日本株日足（ARM64 Windows で pyarrow ビルド不可のため CSV.gz 保存）
+# pip install jquants-api-client --no-deps  (pandas<3.0.0 制約を回避)
+jquants-api-client>=2.2.0
+tenacity>=9.0.0
+tqdm>=4.0.0
