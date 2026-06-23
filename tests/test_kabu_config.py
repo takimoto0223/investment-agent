@@ -66,6 +66,46 @@ class TestKabuConfig(unittest.TestCase):
         cfg = self._cfg(KABU_ENV="staging")
         self.assertIn(":18081/", cfg.base_url)
 
+    # ── パスワード選択 ────────────────────────────────────────────
+
+    def test_test_port_selects_test_password(self):
+        """解決後ポート18081(検証) → TEST用パスワードが選ばれる。"""
+        cfg = self._cfg(
+            KABU_ENV="test",
+            KABU_API_PASSWORD_TEST="pw_test",
+            KABU_API_PASSWORD_LIVE="pw_live",
+        )
+        self.assertEqual(cfg.password, "pw_test")
+
+    def test_live_port_selects_live_password(self):
+        """解決後ポート18080(本番) → LIVE用パスワードが選ばれる。"""
+        cfg = self._cfg(
+            KABU_ENV="live",
+            KABU_API_PASSWORD_TEST="pw_test",
+            KABU_API_PASSWORD_LIVE="pw_live",
+        )
+        self.assertEqual(cfg.password, "pw_live")
+
+    def test_base_url_override_selects_password_by_port(self):
+        """KABU_BASE_URL で本番ポートを直指定した場合も LIVE パスワードが選ばれる。"""
+        cfg = self._cfg(
+            KABU_ENV="test",
+            KABU_BASE_URL="http://localhost:18080/kabusapi",
+            KABU_API_PASSWORD_TEST="pw_test",
+            KABU_API_PASSWORD_LIVE="pw_live",
+        )
+        self.assertEqual(cfg.password, "pw_live")
+
+    def test_fallback_to_shared_password_on_test_port(self):
+        """_TEST/_LIVE が未設定なら KABU_API_PASSWORD にフォールバック(検証)。"""
+        cfg = self._cfg(KABU_ENV="test", KABU_API_PASSWORD="pw_shared")
+        self.assertEqual(cfg.password, "pw_shared")
+
+    def test_fallback_to_shared_password_on_live_port(self):
+        """_TEST/_LIVE が未設定なら KABU_API_PASSWORD にフォールバック(本番)。"""
+        cfg = self._cfg(KABU_ENV="live", KABU_API_PASSWORD="pw_shared")
+        self.assertEqual(cfg.password, "pw_shared")
+
 
 class TestKabuBrokerLiveGuard(unittest.TestCase):
     """本番環境での誤発注ガードを確認する。"""

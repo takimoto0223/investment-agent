@@ -27,6 +27,15 @@ def _kabu_ws_url() -> str:
     return f"ws://localhost:{port}/kabusapi/websocket"
 
 
+def _kabu_password(base_url: str) -> str:
+    # base_url のポート判定と同一のロジックからパスワードを選択する。
+    # Why: 接続先ポートと別のフラグでパスワードを選ぶと「本番ポートに検証パスワード」等の
+    # 食い違いが起きうる。base_url が唯一の判定源であることで両者を常に一致させる。
+    if ":18080" in base_url:
+        return os.getenv("KABU_API_PASSWORD_LIVE") or os.getenv("KABU_API_PASSWORD", "")
+    return os.getenv("KABU_API_PASSWORD_TEST") or os.getenv("KABU_API_PASSWORD", "")
+
+
 @dataclass
 class RiskLimits:
     """リスク上限。エージェント全体で参照する唯一の真実源。"""
@@ -45,14 +54,20 @@ class KabuConfig:
 
     KABU_ENV で検証(test)/本番(live)を切り替える。
     デフォルトを test にする理由: 未設定・誤設定時の実弾発注事故を防ぐ。
+    パスワードは __post_init__ で base_url から導出する（別フラグ不要）。
     """
     # ポート: 18080=本番(live) / 18081=検証(test)
     env: str = field(default_factory=lambda: os.getenv("KABU_ENV", "test"))
     base_url: str = field(default_factory=_kabu_base_url)
     ws_url: str = field(default_factory=_kabu_ws_url)
-    password: str = field(default_factory=lambda: os.getenv("KABU_API_PASSWORD", ""))
+    password: str = field(init=False)
     # kabuステーションはローカル起動前提のため、接続タイムアウトを短めに
     timeout_sec: int = 5
+
+    def __post_init__(self):
+        # base_url 確定後に同一のポート判定でパスワードを導出する。
+        # init=False にすることでコンストラクタから渡せなくし、常にここで一元決定する。
+        self.password = _kabu_password(self.base_url)
 
 
 @dataclass
