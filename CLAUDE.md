@@ -55,10 +55,11 @@ ScalpDay_JP/US + MomentSwing_JP/US の4ポッドで自動投資を行う。
 - **非ASCII出力は文字化け対策を必須とする**: コンソール・ログに日本語など非ASCII文字を出力する
   スクリプトを新規作成・編集するときは、`import` 群の直後に必ず追加する:
   ```python
-  sys.stdout.reconfigure(errors="backslashreplace")
+  sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
   ```
-  文字コードを特定値に固定しない理由: 化けの原因は出力側とコンソール側のコード不一致なので、
-  特定エンコードへの固定より「表現できない文字をクラッシュや化けでなく `\uXXXX` 表記に倒す」安全策をとる
+  両方必要な理由: `encoding` でコンソール側と出力側のコードを UTF-8 に揃える（これがないと
+  cp932↔UTF-8 の不一致で化ける）。`errors` で表現不能文字でもクラッシュせず
+  `\uXXXX` 表記に倒す二段構え
 - **既存スクリプトへの後付け**: 触る機会があればその際に同じ対応を入れて揃えていく
 
 ### 開発ワークフロー
