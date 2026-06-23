@@ -3,10 +3,28 @@ config/settings.py
 全エージェント共通の設定・定数を管理する。
 """
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+# kabuポート対応: 18080=本番(live) / 18081=検証(test)
+_KABU_PORTS = {"live": 18080, "test": 18081}
+
+
+def _kabu_base_url() -> str:
+    # KABU_BASE_URL が明示されていれば最優先（個別上書き用）
+    explicit = os.getenv("KABU_BASE_URL")
+    if explicit:
+        return explicit
+    port = _KABU_PORTS.get(os.getenv("KABU_ENV", "test"), 18081)
+    return f"http://localhost:{port}/kabusapi"
+
+
+def _kabu_ws_url() -> str:
+    port = _KABU_PORTS.get(os.getenv("KABU_ENV", "test"), 18081)
+    return f"ws://localhost:{port}/kabusapi/websocket"
 
 
 @dataclass
@@ -23,9 +41,16 @@ class RiskLimits:
 
 @dataclass
 class KabuConfig:
-    """kabu STATION API 設定。"""
-    base_url: str = os.getenv("KABU_BASE_URL", "http://localhost:18080/kabusapi")
-    password: str = os.getenv("KABU_API_PASSWORD", "")
+    """kabu STATION API 設定。
+
+    KABU_ENV で検証(test)/本番(live)を切り替える。
+    デフォルトを test にする理由: 未設定・誤設定時の実弾発注事故を防ぐ。
+    """
+    # ポート: 18080=本番(live) / 18081=検証(test)
+    env: str = field(default_factory=lambda: os.getenv("KABU_ENV", "test"))
+    base_url: str = field(default_factory=_kabu_base_url)
+    ws_url: str = field(default_factory=_kabu_ws_url)
+    password: str = field(default_factory=lambda: os.getenv("KABU_API_PASSWORD", ""))
     # kabuステーションはローカル起動前提のため、接続タイムアウトを短めに
     timeout_sec: int = 5
 
