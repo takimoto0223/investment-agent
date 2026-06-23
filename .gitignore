@@ -94,8 +94,9 @@ coverage.xml
 *.tar.gz
 *.zip
 
-# Backtests (large data files / run artifacts)
-backtests/
+# Backtests: 生成HTMLとデータのみ除外。ソースコードは追跡する
+backtests/runs/
+backtests/**/__pycache__/
 
 # J-Quants 取得データ（コードから再生成可能。J-Quants 規約で再配布禁止）
 data/historical/bars/*.csv.gz
