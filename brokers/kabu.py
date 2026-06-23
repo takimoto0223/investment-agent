@@ -28,8 +28,9 @@ class OrderResult:
 class KabuBroker:
     """kabu STATION APIのラッパー。発注・残高・ポジション取得を担う。"""
 
-    def __init__(self):
-        self.base_url = KABU.base_url
+    def __init__(self, config=None):
+        _cfg = config or KABU
+        self.base_url = _cfg.base_url
         self._token: Optional[str] = None
 
     # ------------------------------------------------------------------
@@ -37,11 +38,13 @@ class KabuBroker:
     # ------------------------------------------------------------------
     def _guard_live_order(self) -> None:
         """本番環境での誤発注を防ぐガード。
-        KABU_ENV=live かつ KABU_ALLOW_LIVE_ORDER=1 が未設定なら例外を投げる。
+        判定は KABU_ENV の宣言値ではなく解決後の base_url が :18080 を含むかで行う。
+        Why: KABU_ENV=test でも KABU_BASE_URL で本番ポートを直指定した場合など、
+        宣言と実体がずれた設定でも確実にガードが効くようにするため。
         """
-        if os.getenv("KABU_ENV", "test") == "live" and os.getenv("KABU_ALLOW_LIVE_ORDER") != "1":
+        if ":18080" in self.base_url and os.getenv("KABU_ALLOW_LIVE_ORDER") != "1":
             raise RuntimeError(
-                "本番環境(KABU_ENV=live)での発注をブロックしました。"
+                f"本番ポート(base_url={self.base_url})への発注をブロックしました。"
                 " 意図的な発注の場合は KABU_ALLOW_LIVE_ORDER=1 を設定してください。"
             )
 

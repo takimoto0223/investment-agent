@@ -79,50 +79,69 @@ class TestKabuBrokerLiveGuard(unittest.TestCase):
                 del os.environ[k]
         os.environ.update(self._saved)
 
-    def _broker(self):
+    def _broker(self, **kabu_env):
+        """KABU_* 環境変数をクリアして kabu_env だけを設定した fresh な KabuConfig を注入する。
+        シングルトン KABU に依存せず、解決後の base_url をテストで制御できる。
+        """
         from brokers.kabu import KabuBroker
-        return KabuBroker()
+        from config.settings import KabuConfig
+        for k in list(os.environ):
+            if k.startswith("KABU_"):
+                del os.environ[k]
+        os.environ.update(kabu_env)
+        return KabuBroker(config=KabuConfig())
 
-    # ── live + フラグなし → ブロック ──────────────────────────────
+    # ── 本番ポート(18080) + フラグなし → ブロック ────────────────
 
-    def test_send_cash_order_blocked_in_live(self):
-        os.environ["KABU_ENV"] = "live"
+    def test_send_cash_order_blocked_on_live_port(self):
         with self.assertRaises(RuntimeError):
-            self._broker().send_cash_order("1234", "2", 100)
+            self._broker(KABU_ENV="live").send_cash_order("1234", "2", 100)
 
-    def test_send_margin_order_blocked_in_live(self):
-        os.environ["KABU_ENV"] = "live"
+    def test_send_margin_order_blocked_on_live_port(self):
         with self.assertRaises(RuntimeError):
-            self._broker().send_margin_order("1234", "2", 100)
+            self._broker(KABU_ENV="live").send_margin_order("1234", "2", 100)
 
-    def test_cancel_order_blocked_in_live(self):
-        os.environ["KABU_ENV"] = "live"
+    def test_cancel_order_blocked_on_live_port(self):
         with self.assertRaises(RuntimeError):
-            self._broker().cancel_order("ORDER001")
+            self._broker(KABU_ENV="live").cancel_order("ORDER001")
 
-    # ── live + KABU_ALLOW_LIVE_ORDER=1 → ガード通過 ─────────────
+    # ── 本番ポート + KABU_ALLOW_LIVE_ORDER=1 → ガード通過 ───────
 
     def test_send_cash_order_allowed_with_flag(self):
-        os.environ["KABU_ENV"] = "live"
-        os.environ["KABU_ALLOW_LIVE_ORDER"] = "1"
         with patch("requests.post", side_effect=ConnectionError("kabu not running")):
-            result = self._broker().send_cash_order("1234", "2", 100)
-        # RuntimeError ではなく OrderResult が返ること
+            result = self._broker(KABU_ENV="live", KABU_ALLOW_LIVE_ORDER="1").send_cash_order("1234", "2", 100)
         self.assertFalse(result.success)
 
-    # ── test 環境 → ガード通過 ───────────────────────────────────
+    # ── 検証ポート(18081) → ガード通過 ──────────────────────────
 
-    def test_send_cash_order_not_blocked_in_test(self):
-        os.environ["KABU_ENV"] = "test"
+    def test_send_cash_order_not_blocked_on_test_port(self):
         with patch("requests.post", side_effect=ConnectionError("kabu not running")):
-            result = self._broker().send_cash_order("1234", "2", 100)
-        # ガードを通過し、接続エラーが OrderResult で返ること
+            result = self._broker(KABU_ENV="test").send_cash_order("1234", "2", 100)
         self.assertFalse(result.success)
 
     def test_default_env_not_blocked(self):
-        """KABU_ENV 未設定(デフォルト=test)でもガードを通過する。"""
+        """KABU_ENV 未設定(デフォルト=18081)でもガードを通過する。"""
         with patch("requests.post", side_effect=ConnectionError("kabu not running")):
             result = self._broker().send_cash_order("1234", "2", 100)
+        self.assertFalse(result.success)
+
+    # ── 宣言と実体が食い違うケース ───────────────────────────────
+
+    def test_blocked_when_base_url_points_to_live_despite_test_env(self):
+        """KABU_ENV=test でも KABU_BASE_URL で本番ポートを直指定したらガードが効く。"""
+        with self.assertRaises(RuntimeError):
+            self._broker(
+                KABU_ENV="test",
+                KABU_BASE_URL="http://localhost:18080/kabusapi",
+            ).send_cash_order("1234", "2", 100)
+
+    def test_not_blocked_when_base_url_points_to_test_despite_live_env(self):
+        """KABU_ENV=live でも KABU_BASE_URL で検証ポートを直指定したらガードを通過する。"""
+        with patch("requests.post", side_effect=ConnectionError("kabu not running")):
+            result = self._broker(
+                KABU_ENV="live",
+                KABU_BASE_URL="http://localhost:18081/kabusapi",
+            ).send_cash_order("1234", "2", 100)
         self.assertFalse(result.success)
 
 
