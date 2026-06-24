@@ -413,21 +413,18 @@ def run_moment_swing_jp_session(paper: bool = True):
         return
 
     # 価格補完（Criticが price=0 を即否決するため審査前に取得）
+    # stop_loss は screen_value が設定した Darvas 床（絶対価格）を保持し上書きしない
+    # take_profit は Darvas トレイリングが出口のため None のまま
     for proposal in proposals:
         try:
             board = mkt.get_board(proposal.symbol)
             current_price = float(board.get("CurrentPrice", 0))
             if current_price > 0:
-                sl_pct = proposal.extra.get("stop_loss_pct", 0.06)
-                tp_pct = proposal.extra.get("target_return_pct", 0.12)
-                proposal.price       = current_price
-                proposal.qty         = int(max_pos_jpy / current_price / 100) * 100
-                proposal.qty         = max(100, proposal.qty)
-                proposal.stop_loss   = round(current_price * (1 - sl_pct), 0)
-                proposal.take_profit = round(current_price * (1 + tp_pct), 0)
+                proposal.price = current_price
+                proposal.qty   = max(100, int(max_pos_jpy / current_price / 100) * 100)
                 logger.info(
                     f"{proposal.symbol}: 価格補完 ¥{current_price:.0f} "
-                    f"SL=¥{proposal.stop_loss:.0f} TP=¥{proposal.take_profit:.0f} qty={proposal.qty}"
+                    f"Darvas床=¥{proposal.stop_loss:.0f} qty={proposal.qty}"
                 )
         except Exception as e:
             logger.warning(f"{proposal.symbol}: 価格補完失敗 {e}")
@@ -457,14 +454,14 @@ def run_moment_swing_jp_session(paper: bool = True):
             if result.success:
                 logger.info(f"[MomentSwingJP 買い] {proposal.symbol} x{proposal.qty} order_id={result.order_id}")
                 executed.append({
-                    "symbol":            proposal.symbol,
-                    "name":              proposal.extra.get("name", proposal.symbol),
-                    "qty":               proposal.qty,
-                    "price":             proposal.price,
-                    "rationale":         proposal.rationale,
-                    "order_id":          result.order_id,
-                    "stop_loss_pct":     proposal.extra.get("stop_loss_pct", 0.06),
-                    "target_return_pct": proposal.extra.get("target_return_pct", 0.12),
+                    "symbol":       proposal.symbol,
+                    "name":         proposal.extra.get("name", proposal.symbol),
+                    "qty":          proposal.qty,
+                    "price":        proposal.price,
+                    "rationale":    proposal.rationale,
+                    "order_id":     result.order_id,
+                    "darvas_floor": proposal.extra.get("darvas_floor", proposal.stop_loss),
+                    "entry_date":   datetime.now().isoformat(),
                 })
             else:
                 logger.warning(f"{proposal.symbol}: 発注失敗 — {result.message}")
@@ -472,51 +469,53 @@ def run_moment_swing_jp_session(paper: bool = True):
         else:
             logger.info(f"[ペーパー] MomentSwingJP 発注シミュレート: {proposal.symbol} ¥{proposal.price:.0f} x{proposal.qty}")
             executed.append({
-                "symbol":            proposal.symbol,
-                "name":              proposal.extra.get("name", proposal.symbol),
-                "qty":               proposal.qty,
-                "price":             proposal.price,
-                "rationale":         proposal.rationale,
-                "order_id":          "paper",
-                "stop_loss_pct":     proposal.extra.get("stop_loss_pct", 0.06),
-                "target_return_pct": proposal.extra.get("target_return_pct", 0.12),
+                "symbol":       proposal.symbol,
+                "name":         proposal.extra.get("name", proposal.symbol),
+                "qty":          proposal.qty,
+                "price":        proposal.price,
+                "rationale":    proposal.rationale,
+                "order_id":     "paper",
+                "darvas_floor": proposal.extra.get("darvas_floor", proposal.stop_loss),
+                "entry_date":   datetime.now().isoformat(),
             })
 
     _save_moment_swing_jp_log(executed, total_jpy, ctx.risk_level, rejected)
 
-    # SL/TP 監視（引けまで 15 分ごとチェック、自動決済せず CxO 経由で通知）
+    # Darvas 床割れ監視（引けまで 15 分ごとチェック、自動決済せず CxO 経由で通知）
     if executed:
-        stop_loss_map   = {e["symbol"]: e["stop_loss_pct"]     for e in executed}
-        take_profit_map = {e["symbol"]: e["target_return_pct"] for e in executed}
-        entry_map       = {e["symbol"]: e["price"]             for e in executed}
+        positions_for_check = [
+            {
+                "symbol":       e["symbol"],
+                "qty":          e["qty"],
+                "entry_date":   e["entry_date"],
+                "darvas_floor": e["darvas_floor"],
+            }
+            for e in executed
+        ]
+        entry_map = {e["symbol"]: e["price"] for e in executed}
 
         from agents.cxo import CXOAgent
         cxo = CXOAgent()
         pending_approval: set[str] = set()
 
-        logger.info(f"MomentSwingJP 監視開始（引けまで）: {list(stop_loss_map.keys())}")
+        logger.info(f"MomentSwingJP Darvas床割れ監視開始（引けまで）: {[p['symbol'] for p in positions_for_check]}")
         while is_trading_hours():
             time.sleep(900)  # 15分ごとチェック
             try:
-                for symbol in list(stop_loss_map.keys()):
-                    board = mkt.get_board(symbol) if paper else broker.get_board(symbol)
-                    current = float(board.get("CurrentPrice", 0))
-                    if current <= 0:
-                        continue
-                    entry = entry_map.get(symbol, current)
-                    chg   = (current - entry) / entry if entry > 0 else 0.0
-                    sl    = stop_loss_map[symbol]
-                    tp    = take_profit_map[symbol]
-                    logger.info(f"  {symbol}: {chg:+.2%} (SL:{sl:.0%}/TP:{tp:.0%})")
-                    if symbol not in pending_approval:
-                        if chg <= -sl:
-                            logger.warning(f"MomentSwingJP SL到達: {symbol} {chg:+.2%}")
-                            cxo.notify_action_required(symbol, "stop_loss", chg, sl, current, (current - entry) * executed[0]["qty"])
-                            pending_approval.add(symbol)
-                        elif chg >= tp:
-                            logger.info(f"MomentSwingJP TP到達: {symbol} {chg:+.2%}")
-                            cxo.notify_action_required(symbol, "take_profit", chg, tp, current, (current - entry) * executed[0]["qty"])
-                            pending_approval.add(symbol)
+                sell_proposals = swing_agent.check_exits(positions_for_check)
+                for sp in sell_proposals:
+                    if sp.symbol not in pending_approval:
+                        floor  = sp.extra.get("current_darvas_floor", 0.0)
+                        entry  = entry_map.get(sp.symbol, floor)
+                        board  = mkt.get_board(sp.symbol) if paper else broker.get_board(sp.symbol)
+                        current = float(board.get("CurrentPrice", floor))
+                        chg     = (current - entry) / entry if entry > 0 else 0.0
+                        qty     = next((e["qty"] for e in executed if e["symbol"] == sp.symbol), 0)
+                        unpl    = (current - entry) * qty
+                        sl_ratio = (entry - floor) / entry if entry > 0 else 0.0
+                        logger.warning(f"MomentSwingJP Darvas床割れ: {sp.symbol} — {sp.rationale}")
+                        cxo.notify_action_required(sp.symbol, "stop_loss", chg, sl_ratio, current, unpl)
+                        pending_approval.add(sp.symbol)
             except Exception as e:
                 logger.error(f"MomentSwingJP 監視エラー: {e}")
 
@@ -608,21 +607,19 @@ def run_moment_swing_us_session():
         return
 
     # ── 価格補完（CriticUS が price=0 を即否決するため、審査前に現在値を取得） ──
+    # stop_loss は screen_value が設定した Darvas 床（絶対価格）を保持し上書きしない
+    # take_profit は Darvas トレイリングが出口のため None のまま
     from data import us_market as us_mkt
     for proposal in proposals:
         try:
             quote = us_mkt.get_quote_us(proposal.symbol)
             current_price = float(quote.get("CurrentPrice", 0))
             if current_price > 0:
-                sl_pct  = proposal.extra.get("stop_loss_pct",    0.08)
-                tp_pct  = proposal.extra.get("target_return_pct", 0.15)
-                proposal.price       = current_price
-                proposal.qty         = max(1, int(max_pos_usd / current_price))
-                proposal.stop_loss   = round(current_price * (1 - sl_pct), 4)
-                proposal.take_profit = round(current_price * (1 + tp_pct), 4)
+                proposal.price = current_price
+                proposal.qty   = max(1, int(max_pos_usd / current_price))
                 logger.info(
                     f"{proposal.symbol}: 価格補完 ${current_price:.2f} "
-                    f"SL=${proposal.stop_loss:.2f} TP=${proposal.take_profit:.2f} qty={proposal.qty}"
+                    f"Darvas床=${proposal.stop_loss:.2f} qty={proposal.qty}"
                 )
         except Exception as e:
             logger.warning(f"{proposal.symbol}: 価格補完失敗 {e}")
@@ -655,13 +652,13 @@ def run_moment_swing_us_session():
                 f"order_id={result.order_id}"
             )
             executed.append({
-                "symbol":     proposal.symbol,
-                "name":       proposal.extra.get("name", proposal.symbol),
-                "qty":        proposal.qty,
-                "rationale":  proposal.rationale,
-                "order_id":   result.order_id,
-                "stop_loss_pct":       proposal.extra.get("stop_loss_pct", 0.08),
-                "target_return_pct":   proposal.extra.get("target_return_pct", 0.15),
+                "symbol":       proposal.symbol,
+                "name":         proposal.extra.get("name", proposal.symbol),
+                "qty":          proposal.qty,
+                "rationale":    proposal.rationale,
+                "order_id":     result.order_id,
+                "darvas_floor": proposal.extra.get("darvas_floor", proposal.stop_loss),
+                "entry_date":   datetime.now().isoformat(),
             })
         else:
             logger.warning(f"{proposal.symbol}: 発注失敗 — {result.message}")
@@ -674,9 +671,17 @@ def run_moment_swing_us_session():
         logger.info("=== MomentSwing_US セッション終了（発注なし） ===")
         return
 
-    # 当日発注分の SL/TP マップ
-    stop_loss_map   = {e["symbol"]: e.get("stop_loss_pct",    0.08) for e in executed}
-    take_profit_map = {e["symbol"]: e.get("target_return_pct", 0.15) for e in executed}
+    # 当日発注分を check_exits 用ポジションリストに変換
+    positions_for_check = [
+        {
+            "symbol":       e["symbol"],
+            "qty":          e["qty"],
+            "entry_date":   e["entry_date"],
+            "darvas_floor": e["darvas_floor"],
+        }
+        for e in executed
+    ]
+    monitored_symbols = {e["symbol"] for e in executed}
 
     # 前日以前から保有中のポジションを moment_swing_us_log から復元（翌日監視対応）
     _log = Path("logs/moment_swing_us_log.json")
@@ -689,14 +694,21 @@ def run_moment_swing_us_session():
                     historical[entry["symbol"]] = entry
             held_symbols = {p["symbol"] for p in existing_positions}
             for sym in held_symbols:
-                if sym not in stop_loss_map and sym in historical:
+                if sym not in monitored_symbols and sym in historical:
                     h = historical[sym]
-                    stop_loss_map[sym]   = h.get("stop_loss_pct",    0.08)
-                    take_profit_map[sym] = h.get("target_return_pct", 0.15)
-                    logger.info(
-                        f"前日ポジション監視追加: {sym} "
-                        f"SL={stop_loss_map[sym]:.0%} TP={take_profit_map[sym]:.0%}"
-                    )
+                    darvas_floor = float(h.get("darvas_floor", 0.0))
+                    entry_date   = h.get("entry_date", "")
+                    if darvas_floor > 0 and entry_date:
+                        positions_for_check.append({
+                            "symbol":       sym,
+                            "qty":          int(h.get("qty", 1)),
+                            "entry_date":   entry_date,
+                            "darvas_floor": darvas_floor,
+                        })
+                        monitored_symbols.add(sym)
+                        logger.info(f"前日ポジション監視追加: {sym} Darvas床={darvas_floor:.2f}")
+                    else:
+                        logger.warning(f"前日ポジション {sym}: darvas_floor/entry_date 不足 → スキップ（旧ログ形式の可能性）")
         except Exception as e:
             logger.warning(f"MomentSwingUSログ読み込み失敗（前日ポジション復元スキップ）: {e}")
 
@@ -705,43 +717,44 @@ def run_moment_swing_us_session():
     pending_approval: set[str] = set()  # 通知済みで承認待ちの銘柄（重複通知防止）
 
     session_end = _us_session_end()
-    logger.info(f"MomentSwingUS 監視開始（{session_end.strftime('%H:%M')}まで）: {list(stop_loss_map.keys())}")
+    logger.info(f"MomentSwingUS Darvas床割れ監視開始（{session_end.strftime('%H:%M')}まで）: {list(monitored_symbols)}")
 
     while datetime.now() < session_end:
         time.sleep(1800)  # 30分ごとチェック
         try:
             positions = broker.get_positions()
             pos_map   = {p["symbol"]: p for p in positions}
-            for symbol in list(stop_loss_map.keys()):
-                pos = pos_map.get(symbol)
-                if not pos:
-                    # ポジションが消えた（ユーザーが手動決済）→ 監視解除
-                    stop_loss_map.pop(symbol, None)
-                    take_profit_map.pop(symbol, None)
-                    pending_approval.discard(symbol)
-                    continue
-                entry   = float(pos["avg_entry_price"])
-                current = float(pos["current_price"])
-                chg     = (current - entry) / entry if entry > 0 else 0.0
-                unpl    = float(pos["unrealized_pl"])
-                sl_pct  = stop_loss_map[symbol]
-                tp_pct  = take_profit_map.get(symbol, 0.15)
-                logger.info(f"  {symbol}: {chg:+.2%} 含み損益 ${unpl:+.2f} (SL:{sl_pct:.0%}/TP:{tp_pct:.0%})")
 
-                # SL/TP 条件到達 → CxO 経由でメール通知（自動決済しない）
-                if symbol not in pending_approval:
-                    if chg <= -sl_pct:
-                        logger.warning(f"MomentSwingUS SL条件到達: {symbol} {chg:+.2%} — 要承認メール送信")
-                        cxo.notify_action_required(
-                            symbol, "stop_loss", chg, sl_pct, current, unpl
-                        )
-                        pending_approval.add(symbol)
-                    elif chg >= tp_pct:
-                        logger.info(f"MomentSwingUS TP条件到達: {symbol} {chg:+.2%} — 要承認メール送信")
-                        cxo.notify_action_required(
-                            symbol, "take_profit", chg, tp_pct, current, unpl
-                        )
-                        pending_approval.add(symbol)
+            # 手動決済済みを監視リストから外す
+            positions_for_check[:] = [
+                p for p in positions_for_check if p["symbol"] in pos_map
+            ]
+            pending_approval -= {sym for sym in list(pending_approval) if sym not in pos_map}
+
+            # 現在値ログ
+            for pfc in positions_for_check:
+                pos = pos_map.get(pfc["symbol"])
+                if pos:
+                    logger.info(
+                        f"  {pfc['symbol']}: 含み損益 ${float(pos['unrealized_pl']):+.2f} "
+                        f"現在${float(pos['current_price']):.2f} "
+                        f"Darvas床={pfc['darvas_floor']:.2f}"
+                    )
+
+            # Darvas 床割れチェック → CxO 経由でメール通知（自動決済しない）
+            sell_proposals = moment_swing_us_agent.check_exits(positions_for_check)
+            for sp in sell_proposals:
+                if sp.symbol not in pending_approval:
+                    pos     = pos_map.get(sp.symbol, {})
+                    current = float(pos.get("current_price", 0))
+                    unpl    = float(pos.get("unrealized_pl", 0))
+                    entry   = float(pos.get("avg_entry_price", current))
+                    floor   = sp.extra.get("current_darvas_floor", 0.0)
+                    chg     = (current - entry) / entry if entry > 0 else 0.0
+                    sl_ratio = (entry - floor) / entry if entry > 0 else 0.0
+                    logger.warning(f"MomentSwingUS Darvas床割れ: {sp.symbol} {chg:+.2%} — 要承認メール送信")
+                    cxo.notify_action_required(sp.symbol, "stop_loss", chg, sl_ratio, current, unpl)
+                    pending_approval.add(sp.symbol)
         except Exception as e:
             logger.error(f"MomentSwingUS 監視エラー: {e}")
 

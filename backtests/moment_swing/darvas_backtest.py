@@ -15,10 +15,11 @@ Darvas ボックスによる MomentSwing バックテストエンジン。
   4. エントリー: 終値 > 天井 → 翌日始値で買い
   5. エグジット: 終値 < 現在の床 → 翌日始値で損切り
   6. トレイリング: ポジション中に新しい床が確定し、現在の床より高ければ引き上げ
+
+Darvas ロジック（箱形成・週足フィルタ）は strategies.darvas の共通モジュールを使用。
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from typing import List, Tuple
 from typing import Optional
@@ -27,8 +28,11 @@ import pandas as pd
 
 from config.settings import RISK
 from data.historical.jp_bars import fetch_daily_bars, load_bars, save_bars
-from data.historical.resample import resample_bars
-from data.historical.newhigh import screen_new_high
+from strategies.darvas import (
+    DarvasBoxMachine,
+    DarvasParams,
+    build_weekly_filter,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -36,14 +40,13 @@ from data.historical.newhigh import screen_new_high
 # ---------------------------------------------------------------------------
 
 @dataclass
-class BacktestParams:
-    top_n: int = 3              # 天井確定: N日間新高値なしで確定
-    bottom_m: int = 3           # 床確定: M日間新安値なしで確定
+class BacktestParams(DarvasParams):
+    """
+    バックテスト固有パラメータ（Darvas ロジックパラメータを DarvasParams から継承）。
+    バックテスト専用フィールド: スリッページ・手数料・ポジションサイズ。
+    """
     slippage_pct: float = 0.1   # 片道スリッページ %
     commission_pct: float = 0.0 # 片道手数料 %（kabu.com オンライン: 無料想定）
-    weekly_filter: bool = True  # 週足フィルタ使用
-    near_high_pct: float = 5.0  # 週足「高値圏」しきい値 %
-    weekly_window: int = 52     # 週足 rolling max の期間（週）
     position_size_jpy: int = field(
         default_factory=lambda: RISK.max_position_jpy
     )
@@ -75,34 +78,6 @@ class BacktestResult:
 
 
 # ---------------------------------------------------------------------------
-# 週足フィルタ構築
-# ---------------------------------------------------------------------------
-
-def _build_weekly_filter(df_daily: pd.DataFrame, params: BacktestParams) -> dict[pd.Timestamp, bool]:
-    """
-    日付 → 週足フィルタ通過か否か の dict を返す。
-    当日より前に確定した最新週足バーが is_new_high or is_near_high なら True。
-
-    Why: 当日の週足バーは未確定（週中）のため、完全に確定した前週以前のみ参照する。
-    """
-    df_w = resample_bars(df_daily, "W")
-    df_ws = screen_new_high(df_w, window=params.weekly_window, near_high_pct=params.near_high_pct)
-    df_ws = df_ws.sort_values("ts_utc").set_index("ts_utc")
-
-    result: dict[pd.Timestamp, bool] = {}
-    for _, row in df_daily.iterrows():
-        date = row["ts_utc"]
-        # 当日より前に終端する週足バーのみ（当日以前を含む週は未確定）
-        prev = df_ws[df_ws.index < date]
-        if prev.empty:
-            result[date] = False
-        else:
-            last = prev.iloc[-1]
-            result[date] = bool(last["is_new_high"] or last["is_near_high"])
-    return result
-
-
-# ---------------------------------------------------------------------------
 # シミュレーション本体
 # ---------------------------------------------------------------------------
 
@@ -117,19 +92,15 @@ def _simulate(
 
     Why: ベクトル演算では「前日の信号→翌日の始値約定」の境界を誤りやすいため、
     明示的な日次ループで pending フラグを1日ずらして約定する。
+
+    箱形成ロジックは strategies.darvas.DarvasBoxMachine を使用（エージェントと共通）。
     """
     daily = df.reset_index(drop=True)
     n = len(daily)
     trades: list[Trade] = []
 
     # --- 箱形成ステート（エントリー前） ---
-    phase = "search_top"        # "search_top" | "search_bottom" | "box_ready"
-    cand_top = -math.inf
-    no_new_high = 0
-    box_top: Optional[float] = None
-    cand_bottom = math.inf
-    no_new_low = 0
-    box_bottom: Optional[float] = None
+    entry_machine = DarvasBoxMachine(params.top_n, params.bottom_m)
 
     # --- ポジションステート ---
     in_position = False
@@ -141,12 +112,7 @@ def _simulate(
     stop_level = 0.0            # 現在の損切り水準（トレイリングで更新）
 
     # --- トレイリング箱形成（ポジション中） ---
-    t_phase = "search_top"
-    t_cand_top = -math.inf
-    t_no_new_high = 0
-    t_box_top: Optional[float] = None
-    t_cand_bottom = math.inf
-    t_no_new_low = 0
+    trail_machine: Optional[DarvasBoxMachine] = None
 
     # --- 翌日約定待ちシグナル ---
     pending: Optional[str] = None   # "buy" | "sell"
@@ -174,19 +140,15 @@ def _simulate(
             entry_box_top = p_box_top
             entry_box_bottom = p_box_bottom
             stop_level = p_box_bottom
-            # 単元株(100株)単位でサイジング
             raw_shares = int(params.position_size_jpy / entry_price / 100) * 100
             entry_shares = max(raw_shares, 100)
             in_position = True
             pending = None
-            stop_history_cur = [(entry_date, stop_level)]  # 初期ストップを記録
-            # トレイリング箱の初期化
-            t_phase = "search_top"
-            t_cand_top = h
-            t_no_new_high = 0
-            t_box_top = None
-            t_cand_bottom = lo
-            t_no_new_low = 0
+            stop_history_cur = [(entry_date, stop_level)]
+            # トレイリング機械を初期化（当日バーの h/lo で初期値を設定）
+            # Why: backtest の「Phase A 後に t_cand_top=h で初期化」に対応
+            trail_machine = DarvasBoxMachine(params.top_n, params.bottom_m,
+                                             init_h=h, init_lo=lo)
 
         elif pending == "sell" and in_position:
             slip = o * params.slippage_pct / 100
@@ -211,105 +173,44 @@ def _simulate(
             ))
             in_position = False
             pending = None
+            trail_machine = None
             stop_history_cur = []
-            # 箱形成を初期化してリスタート
-            phase = "search_top"
-            cand_top = -math.inf
-            no_new_high = 0
-            box_top = None
-            cand_bottom = math.inf
-            no_new_low = 0
-            box_bottom = None
+            # エントリー機械をリセット
+            entry_machine = DarvasBoxMachine(params.top_n, params.bottom_m)
 
         # ================================================================
         # B. エントリー前の箱形成ステート更新
         # ================================================================
         if not in_position:
-            if phase == "search_top":
-                if h > cand_top:
-                    cand_top = h
-                    no_new_high = 0
-                else:
-                    no_new_high += 1
-                    if no_new_high >= params.top_n:
-                        box_top = cand_top
-                        phase = "search_bottom"
-                        cand_bottom = lo
-                        no_new_low = 0
-
-            elif phase == "search_bottom":
-                if h > box_top:                 # 天井を上抜け → 箱をリセット
-                    cand_top = h
-                    no_new_high = 0
-                    box_top = None
-                    phase = "search_top"
-                elif lo < cand_bottom:
-                    cand_bottom = lo
-                    no_new_low = 0
-                else:
-                    no_new_low += 1
-                    if no_new_low >= params.bottom_m:
-                        box_bottom = cand_bottom
-                        phase = "box_ready"
-
-            elif phase == "box_ready":
-                if c > box_top:
-                    # 終値が天井を上抜け → 翌営業日始値で買い（ルックアヘッド回避）
-                    # Why: h > box_top（日中ヒゲ）は箱維持。確定は終値のみで判断する。
+            if entry_machine.phase == "box_ready":
+                # ブレイクアウト判定（日中ヒゲ h > box_top は無視、終値のみ）
+                if c > entry_machine.box_top:
                     if not params.weekly_filter or weekly_ok.get(date, False):
                         pending = "buy"
-                        p_box_top = box_top
-                        p_box_bottom = box_bottom
+                        p_box_top = entry_machine.box_top
+                        p_box_bottom = entry_machine.box_bottom
+            else:
+                entry_machine.step(h, lo)
 
         # ================================================================
         # C. ポジション中: 損切り判定 & トレイリング床更新
         # ================================================================
         else:
             if c < stop_level and pending is None:
-                # 終値が床を下回り → 翌日損切り
                 pending = "sell"
 
-            elif pending is None:
-                # トレイリング箱形成
-                if t_phase == "search_top":
-                    if h > t_cand_top:
-                        t_cand_top = h
-                        t_no_new_high = 0
-                    else:
-                        t_no_new_high += 1
-                        if t_no_new_high >= params.top_n:
-                            t_box_top = t_cand_top
-                            t_phase = "search_bottom"
-                            t_cand_bottom = lo
-                            t_no_new_low = 0
-
-                elif t_phase == "search_bottom":
-                    if h > t_box_top:
-                        t_cand_top = h
-                        t_no_new_high = 0
-                        t_box_top = None
-                        t_phase = "search_top"
-                    elif lo < t_cand_bottom:
-                        t_cand_bottom = lo
-                        t_no_new_low = 0
-                    else:
-                        t_no_new_low += 1
-                        if t_no_new_low >= params.bottom_m:
-                            new_floor = t_cand_bottom
-                            if new_floor > stop_level:  # 床を切り上げる場合のみ更新
-                                stop_level = new_floor
-                                stop_history_cur.append((date, stop_level))
-                            # トレイリング追跡をリセットして次の箱を探す
-                            t_phase = "search_top"
-                            t_cand_top = h
-                            t_no_new_high = 0
-                            t_box_top = None
-                            t_cand_bottom = lo
-                            t_no_new_low = 0
+            elif pending is None and trail_machine is not None:
+                box_confirmed = trail_machine.step(h, lo)
+                if box_confirmed:
+                    new_floor = trail_machine.box_bottom
+                    if new_floor > stop_level:
+                        stop_level = new_floor
+                        stop_history_cur.append((date, stop_level))
+                    # 次の箱探索のためにリセット
+                    trail_machine.next_box(h, lo)
 
     # ================================================================
     # D. データ末尾でポジションを終値で手仕舞い
-    # pending=="sell" のときはトレイリング損切りが発動済みだが次の足がないケース
     # ================================================================
     if in_position:
         last = daily.iloc[-1]
@@ -352,8 +253,6 @@ def _summarize(trades: list[Trade]) -> dict:
 
     # 最大ドローダウン（複利 equity curve ベース）
     # Why: 旧式は peak 初期値0のため第1トレードが損失だと必ず -100% になる欠陥があった。
-    # pnl_pct を複利合成した equity curve（初期値 1.0）を使い、
-    # 確定トレードの収益率ベースの最大ドローダウンを正確に計測する。
     equity = 1.0
     peak = 1.0
     max_dd = 0.0
@@ -384,7 +283,6 @@ def run_backtest(symbol: str, params: Optional[BacktestParams] = None) -> Backte
     if params is None:
         params = BacktestParams()
 
-    # キャッシュがあれば使用、なければ取得して保存
     try:
         df = load_bars(symbol)
     except FileNotFoundError:
@@ -395,6 +293,6 @@ def run_backtest(symbol: str, params: Optional[BacktestParams] = None) -> Backte
     if df.empty:
         raise ValueError(f"{symbol} のデータが取得できませんでした。")
 
-    weekly_ok = _build_weekly_filter(df, params)
+    weekly_ok = build_weekly_filter(df, params)
     trades = _simulate(df, weekly_ok, params, symbol)
     return BacktestResult(symbol=symbol, params=params, trades=trades)
