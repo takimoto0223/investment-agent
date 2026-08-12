@@ -12,6 +12,9 @@ python-dotenv>=1.0.0
 pandas>=2.2.0
 numpy>=2.0.0
 
+# 株価取得（scripts/activist_entry_screen.py で使用）
+yfinance>=0.2.50
+
 # スケジューリング（朝8時の自動起動）
 schedule>=1.2.0
 
