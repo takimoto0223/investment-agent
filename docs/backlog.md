@@ -398,6 +398,23 @@ B2 を含む出口系改良の射程外であることが日米比較で確認�
 - **ハーネス**: エージェントにツールを与え/ループを回し/結果を検証する足場の考え方。
   テストやバックテスト自動化の設計時に効いてくる。
 
+## アクティビスト大量保有ウォッチ(エントリー水準スクリーニング)
+狙い: 大量保有報告の「報告義務発生日」前後VWAPをファンドのエントリー水準の近似とし、
+現在値が同水準以下の銘柄を抽出する(docs/activist_watch_*.md 参照)。
+
+完了:
+- scripts/activist_entry_screen.py 新設(2026-08-12) → J-Quants優先+yfinanceフォールバックに改修(2026-09-08)。
+  実行: `python -m scripts.activist_entry_screen`。data/activist_filings.csv が入力
+- 報道ベースの銘柄リスト・ウォッチレポート2本(docs/activist_watch_20260812.md / 20260908.md)
+- ⚠未確認行の検証回収(2026-09-08): 高島屋=村上系撤退済み・日本高純度化学=売却減少など前回の誤り訂正
+
+残タスク:
+- ローカル(J-Quantsキー有り)で activist_entry_screen を実行し、報道ベース暫定判定をVWAP機械判定に置換
+  (リモート実行環境はEDINET/株価APIともネットワーク遮断のため実行不可)
+- EDINET原本確認: 淀川製鋼所15.35%の真偽 / 三菱製紙8月買い増し / クラボウ提出年 / エア・ウォーター(オアシス)
+- 取得単価の実額確認(報告書の「取得資金」÷「保有株券等の数」)で VWAP近似との乖離を検証
+- 大量保有データの自動取得経路の検討(EDINET APIはキー要。maonline/irbank はスクレイピング規約要確認)
+
 ## 完了済み(参考)
 - v6組織リファクタ①〜⑥、市場ガード、IntelScout収集スケジュール、命名一気通貫、デッドコード掃除
 - 命名積み残し(template.py等): DaytradeCandidate→ScalpDayCandidate / ValueDecision→SwingDecision 完了

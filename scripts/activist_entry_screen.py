@@ -15,14 +15,21 @@ scripts/activist_entry_screen.py
     - ratio: 表示用の自由記述（例 "新規 5.02%" / "6.74%→7.90%"）
 
 エントリー水準の推定:
-  yfinance の日足終値で、報告義務発生日（なければ提出日の5営業日前）を終端とする
+  日足終値で、報告義務発生日（なければ提出日の5営業日前相当）を終端とする
   直近 N 営業日（既定60）の出来高加重平均（VWAP）。
   ファンドは5%到達までの期間に分散して買うため、単日終値より VWAP を採用する。
   ※ あくまで近似。取得単価の実額は報告書本文（取得資金÷株数）でしか分からない。
 
+データ源（優先順）:
+  1. J-Quants ローカルキャッシュ（data/historical/bars/*.csv.gz — 過去の save_bars 分）
+  2. J-Quants API v2（.env の JQUANTS_API_KEY。取得分はキャッシュに保存）
+     ※ Free プランは約12週遅延のため「現在値」が古くなる。時点を必ず確認すること
+  3. yfinance（{code}.T）
+  現在値の時点が7日超古い場合は ⚠ を付けて明示する。
+
 使い方:
-  python scripts/activist_entry_screen.py
-  python scripts/activist_entry_screen.py --csv path/to/filings.csv --window 60 --tolerance 0.05 --out report.md
+  python -m scripts.activist_entry_screen
+  python -m scripts.activist_entry_screen --csv path/to/filings.csv --window 60 --tolerance 0.05 --out report.md
 """
 import argparse
 import csv
@@ -30,18 +37,16 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+import pandas as pd
 
-try:
-    import yfinance as yf
-except ImportError:
-    print("yfinance が未インストールです: pip install yfinance")
-    sys.exit(1)
+# Windows コンソール UTF-8 化（CLAUDE.md 規約）
+sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
 
 _DEFAULT_CSV       = Path("data/activist_filings.csv")
 _DEFAULT_WINDOW    = 60      # エントリー推定に使う営業日数
 _DEFAULT_TOLERANCE = 0.05    # エントリー水準からの許容上方乖離（5%）
 _FILING_LAG_DAYS   = 7       # 報告義務発生日不明時: 提出日から差し引く暦日数（法定提出期限は5営業日）
+_STALE_DAYS        = 7       # 現在値がこの暦日数より古ければ ⚠ を付ける
 
 
 def load_filings(csv_path: Path) -> list[dict]:
@@ -58,14 +63,77 @@ def load_filings(csv_path: Path) -> list[dict]:
     return rows
 
 
-def estimate_entry_and_current(
-    code: str, filing_date: str, obligation_date: str, window: int,
-) -> tuple[float | None, float | None, str]:
+# ── 日足取得（J-Quants 優先・yfinance フォールバック） ─────────────────
+
+def _bars_from_jquants(code: str) -> pd.DataFrame | None:
+    """J-Quants（キャッシュ→API）から共通スキーマ日足を取得。不可なら None。"""
+    try:
+        from data.historical.jp_bars import fetch_daily_bars, load_bars, save_bars
+    except ImportError:
+        return None
+    try:
+        return load_bars(code)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print(f"⚠ {code} J-Quantsキャッシュ読込失敗: {exc}")
+    try:
+        df = fetch_daily_bars(code, years=2)
+        if df.empty:
+            return None
+        save_bars(df)
+        return df
+    except Exception as exc:
+        print(f"⚠ {code} J-Quants取得失敗: {exc}")
+        return None
+
+
+def _bars_from_yfinance(code: str) -> pd.DataFrame | None:
+    """yfinance から日足を取得し共通スキーマ相当（ts_utc/close/volume）に変換。不可なら None。"""
+    try:
+        import yfinance as yf
+    except ImportError:
+        return None
+    try:
+        hist = yf.Ticker(f"{code}.T").history(period="2y", interval="1d", auto_adjust=False)
+        if len(hist) == 0:
+            return None
+        return pd.DataFrame({
+            "ts_utc": pd.to_datetime(hist.index, utc=True),
+            "close":  hist["Close"].to_numpy(),
+            "volume": hist["Volume"].to_numpy(),
+        })
+    except Exception as exc:
+        print(f"⚠ {code} yfinance取得失敗: {exc}")
+        return None
+
+
+def get_bars(code: str, cache: dict) -> tuple[pd.DataFrame | None, str]:
+    """銘柄の日足と、そのデータ源ラベルを返す（同一銘柄はプロセス内キャッシュ）。"""
+    if code in cache:
+        return cache[code]
+    df = _bars_from_jquants(code)
+    source = "J-Quants"
+    if df is None:
+        df = _bars_from_yfinance(code)
+        source = "yfinance"
+    if df is None:
+        source = "-"
+    cache[code] = (df, source)
+    return df, source
+
+
+# ── 推定ロジック ──────────────────────────────────────────────────────
+
+def estimate(
+    bars: pd.DataFrame, filing_date: str, obligation_date: str, window: int,
+) -> tuple[float | None, float | None, str, str]:
     """
     エントリー水準（VWAP近似）と現在値を返す。
 
     Returns:
-        (entry_vwap, current_price, basis)
+        (entry_vwap, current_price, current_asof, basis)
+        - current_asof: 現在値の時点 "YYYY-MM-DD"（古ければ呼び出し側で ⚠ 判断）
         - basis: エントリー推定の基準日説明（"義務発生日" | "提出日-7d近似"）
     """
     if obligation_date:
@@ -74,47 +142,43 @@ def estimate_entry_and_current(
         end_dt = datetime.strptime(filing_date, "%Y-%m-%d") - timedelta(days=_FILING_LAG_DAYS)
         basis  = f"提出日-{_FILING_LAG_DAYS}d近似"
 
-    ticker = yf.Ticker(f"{code}.T")
-    # 窓の1.8倍の暦日を遡れば営業日 window 本はほぼ確保できる
-    start_dt = end_dt - timedelta(days=int(window * 1.8))
-    hist = ticker.history(
-        start=start_dt.strftime("%Y-%m-%d"),
-        end=(end_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
-        interval="1d", auto_adjust=False,
-    )
+    upto = bars[bars["ts_utc"] <= pd.Timestamp(end_dt, tz="UTC")]
     entry = None
-    if len(hist) > 0:
-        tail = hist.tail(window)
-        vol  = tail["Volume"].sum()
+    if len(upto) > 0:
+        tail = upto.tail(window)
+        vol  = tail["volume"].sum()
         if vol > 0:
-            entry = float((tail["Close"] * tail["Volume"]).sum() / vol)
+            entry = float((tail["close"] * tail["volume"]).sum() / vol)
         else:
-            entry = float(tail["Close"].mean())
+            entry = float(tail["close"].mean())
 
-    recent  = ticker.history(period="10d", interval="1d", auto_adjust=False)
-    current = float(recent["Close"].iloc[-1]) if len(recent) > 0 else None
-    return entry, current, basis
+    current      = float(bars["close"].iloc[-1])
+    current_asof = str(bars["ts_utc"].iloc[-1].date())
+    return entry, current, current_asof, basis
 
 
 def screen(rows: list[dict], window: int, tolerance: float) -> list[dict]:
     """全行を評価し、判定列を付けて返す。"""
-    results = []
+    results, bars_cache = [], {}
     for row in rows:
         code = row["code"].strip()
-        try:
-            entry, current, basis = estimate_entry_and_current(
-                code, row["filing_date"].strip(),
+        bars, src = get_bars(code, bars_cache)
+        if bars is None:
+            entry = current = diff = None
+            asof, basis = "-", "-"
+            print(f"⚠ {code} 全データ源で株価取得失敗")
+        else:
+            entry, current, asof, basis = estimate(
+                bars, row["filing_date"].strip(),
                 (row.get("obligation_date") or "").strip(), window,
             )
-        except Exception as exc:
-            print(f"⚠ {code} 株価取得失敗: {exc}")
-            entry = current = None
-            basis = "-"
-        diff = (current / entry - 1) if (entry and current) else None
+            diff = (current / entry - 1) if (entry and current) else None
         results.append({
             **row,
             "entry_vwap": entry,
             "current":    current,
+            "asof":       asof,
+            "src":        src,
             "diff":       diff,
             "basis":      basis,
             "is_chance":  (diff is not None and diff <= tolerance),
@@ -124,25 +188,29 @@ def screen(rows: list[dict], window: int, tolerance: float) -> list[dict]:
 
 def render(results: list[dict], window: int, tolerance: float) -> str:
     """Markdown テーブルを組み立てる。"""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now()
     lines = [
-        f"# アクティビスト・エントリー水準スクリーニング ({today})",
+        f"# アクティビスト・エントリー水準スクリーニング ({today:%Y-%m-%d})",
         "",
-        f"- エントリー水準 = 基準日までの直近{window}営業日VWAP（yfinance終値×出来高、⚠近似値）",
+        f"- エントリー水準 = 基準日までの直近{window}営業日VWAP（終値×出来高、⚠近似値）",
         f"- 判定 ◎ = 現在値がエントリー水準の +{tolerance:.0%} 以内（同水準以下で仕込める候補）",
+        f"- 現在値の時点が{_STALE_DAYS}日超古い行は時点に ⚠（J-Quants Freeは約12週遅延）",
         "",
-        "| 判定 | 銘柄 | コード | ファンド | 保有割合 | 提出日 | エントリー水準⚠ | 現在値 | 乖離 | 基準 |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| 判定 | 銘柄 | コード | ファンド | 保有割合 | 提出日 | エントリー水準⚠ | 現在値 | 時点 | 乖離 | 基準 | 源 |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in sorted(results, key=lambda x: (x["diff"] is None, x["diff"] or 0)):
         mark    = "◎" if r["is_chance"] else ("−" if r["diff"] is not None else "?")
         entry   = f"{r['entry_vwap']:,.0f}円" if r["entry_vwap"] else "取得不可"
         current = f"{r['current']:,.0f}円" if r["current"] else "取得不可"
         diff    = f"{r['diff']:+.1%}" if r["diff"] is not None else "-"
+        asof    = r["asof"]
+        if asof != "-" and (today - datetime.strptime(asof, "%Y-%m-%d")).days > _STALE_DAYS:
+            asof += "⚠"
         lines.append(
             f"| {mark} | {r.get('name','')} | {r['code']} | {r.get('fund','')} "
             f"| {r.get('ratio','')} | {r.get('filing_date','')} "
-            f"| {entry} | {current} | {diff} | {r['basis']} |"
+            f"| {entry} | {current} | {asof} | {diff} | {r['basis']} | {r['src']} |"
         )
     lines += [
         "",
@@ -163,6 +231,12 @@ def main() -> None:
     if not args.csv.exists():
         print(f"入力CSVが見つかりません: {args.csv}")
         sys.exit(1)
+
+    # .env の JQUANTS_* を読み込む（config.settings の load_dotenv() 経由・任意）
+    try:
+        from config.settings import KABU  # noqa: F401 — import side-effect で dotenv を実行させる
+    except Exception:
+        pass  # 設定が無くても yfinance フォールバックで動かす
 
     rows = load_filings(args.csv)
     print(f"{len(rows)} 件の報告を評価中...")
